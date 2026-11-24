@@ -43,7 +43,9 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, over the ranges its
     /// shaders write merged (offsets, disjoint, in order): what the GPU wrote
     /// differs.
-    before: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// Ranges (offset, length) and their bytes back to back in one pooled
+    /// buffer.
+    before: Mutex<(Vec<(usize, usize)>, Vec<u8>)>,
 }
 
 /// Ranges merged where they overlap or touch: disjoint, in order, empty
@@ -184,15 +186,18 @@ impl Shadow {
     /// shaders start from.
     pub(crate) fn snapshot(&self) {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, bytes) in before.drain(..) {
-            give_back(bytes);
-        }
-        for (from, to) in self.merged() {
-            let mut kept = pooled(to - from);
+        let ranges = self.merged();
+        let total = ranges.iter().map(|&(a, b)| b - a).sum();
+        let mut bytes = pooled(total);
+        for &(from, to) in &ranges {
             // SAFETY: inside the mapping.
-            kept.extend_from_slice(unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) });
-            before.push((from, kept));
+            bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) });
         }
+        let (_, old) = std::mem::replace(
+            &mut *before,
+            (ranges.iter().map(|&(a, b)| (a, b - a)).collect(), bytes),
+        );
+        give_back(old);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -204,14 +209,18 @@ impl Shadow {
     /// merged ranges once. Returns the bytes written.
     pub(crate) fn copy_back_all(&self) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (ranges, bytes) = std::mem::take(&mut *snapshot);
         let mut written = 0;
         let start = self.start as usize;
-        for (from, before) in snapshot.drain(..) {
-            let to = from + before.len();
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+        // By 64 KiB piece: the copy compared with its bytes before the
+        // submission, title memory read only where the GPU wrote.
+        const PIECE: usize = 64 << 10;
+        let mut title = vec![0u8; PIECE];
+        let mut taken = 0;
+        for (from, len) in ranges {
+            let to = from + len;
+            let before = &bytes[taken..taken + len];
+            taken += len;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -256,8 +265,8 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
-            give_back(before);
         }
+        give_back(bytes);
         // The submission is done with every range it declared (one
         // submission runs at a time).
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
