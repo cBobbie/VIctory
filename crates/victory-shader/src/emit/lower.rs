@@ -344,14 +344,55 @@ fn half_local_blocks(p: &Program, st: &Structured) -> Vec<bool> {
                     })
         })
     };
+    // Blocks reading each value (instructions and phi arguments).
+    let mut readers: HashMap<Value, Vec<usize>> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            for r in &inst.reads {
+                readers.entry(r.1).or_default().push(b);
+            }
+        }
+        for phi in &block.phis {
+            for &a in &phi.args {
+                readers.entry(a).or_default().push(b);
+            }
+        }
+    }
     let mut out = vec![false; n];
     for e in 0..n {
         let Exit::Branch { taken: t, .. } = p.blocks[e].exit else { continue };
         if t > e {
             continue;
         }
+        let inside = |y: usize| t <= y && y <= e;
+        // Scalar state each half would hold its own of after the loop (the
+        // console has one for the wave): an SGPR or SCC written in the loop,
+        // not a lane mask, read after it.
+        let escapes = |x: usize| {
+            p.blocks[x].insts.iter().any(|inst| {
+                inst.writes.iter().any(|w| {
+                    matches!(w.0, Reg::S(_) | Reg::Scc)
+                        && !is_mask(w.1)
+                        && readers.get(&w.1).is_some_and(|rs| rs.iter().any(|&y| !inside(y)))
+                })
+            }) || p.blocks[x].phis.iter().any(|phi| {
+                matches!(phi.reg, Reg::S(_) | Reg::Scc)
+                    && !is_mask(phi.value)
+                    && readers.get(&phi.value).is_some_and(|rs| rs.iter().any(|&y| !inside(y)))
+            })
+        };
         let safe = (t..=e).all(|x| {
-            !syncs(x) && p.blocks[x].exit.successors().iter().all(|&y| t <= y && y <= e + 1)
+            !syncs(x)
+                && !escapes(x)
+                // Only branches and forward jumps: a backward jump's
+                // iteration cap ends the whole group (`abort_block`), the
+                // program's end or an indirect jump only one half.
+                && match p.blocks[x].exit {
+                    Exit::Branch { .. } => true,
+                    Exit::Jump(y) => y > x,
+                    _ => false,
+                }
+                && p.blocks[x].exit.successors().iter().all(|&y| t <= y && y <= e + 1)
         });
         if safe {
             for x in out.iter_mut().take(e + 1).skip(t) {
@@ -7733,6 +7774,58 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
         })
+    }
+
+    /// The blocks `super::half_local_blocks` lets each half branch in, for
+    /// a wave64 program run in the console flow.
+    fn half_local(words: &[u32]) -> Vec<bool> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 256).unwrap();
+        let st = structure::structure_console(&p).unwrap();
+        super::half_local_blocks(&p, &st)
+    }
+
+    /// A loop over lane-private data with a read of another lane after it:
+    /// its branches are each half's own.
+    #[test]
+    fn a_loop_over_lane_data_is_half_local() {
+        let words = [
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0004, // s_cbranch_execz end
+            0x4A04_0481, // loop: v_add_nc_u32 v2, 1, v2
+            0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0x88FE_0A7E, // end: s_or_b64 exec, exec, s[10:11]
+            0xD760_0009,
+            0x0001_5102, // v_readlane_b32 s9, v2, 40
+            S_ENDPGM,
+        ];
+        assert!(half_local(&words).iter().any(|&h| h));
+    }
+
+    /// The same loop counting in an SGPR read after it: each half would
+    /// leave with its own count, the console with one for the wave.
+    #[test]
+    fn a_loop_whose_scalar_escapes_is_not_half_local() {
+        let words = [
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0005, // s_cbranch_execz end
+            0x8009_8109, // loop: s_add_u32 s9, s9, 1
+            0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+            0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x88FE_0A7E, // end: s_or_b64 exec, exec, s[10:11]
+            0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+            S_ENDPGM,
+        ];
+        assert!(half_local(&words).iter().all(|&h| !h));
     }
 
     #[test]
