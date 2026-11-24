@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -304,6 +304,33 @@ impl LoadedImage {
             unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
         }
         Ok(())
+    }
+
+    /// Replaces `expect` at `rva` with `with` (the same length) in the
+    /// mapped image; false, changing nothing, if other bytes are there (a
+    /// build the location was not taken from).
+    pub fn patch(&self, rva: usize, expect: &[u8], with: &[u8]) -> Result<bool> {
+        assert_eq!(expect.len(), with.len());
+        if rva + expect.len() > self.info.size_of_image as usize {
+            return Ok(false);
+        }
+        let at = (self.base() + rva) as *mut u8;
+        // SAFETY: inside the mapped image, checked above.
+        let now = unsafe { std::slice::from_raw_parts(at, expect.len()) };
+        if now != expect {
+            return Ok(false);
+        }
+        let mut old = 0;
+        // SAFETY: inside the image.
+        if unsafe { VirtualProtect(at as *const c_void, with.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+            bail!("VirtualProtect({rva:#x}) failed: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: inside the image, now writable; no title thread runs yet.
+        unsafe { std::ptr::copy_nonoverlapping(with.as_ptr(), at, with.len()) };
+        let mut ignored = 0;
+        // SAFETY: restoring the protection we just changed.
+        unsafe { VirtualProtect(at as *const c_void, with.len(), old, &mut ignored) };
+        Ok(true)
     }
 
     /// Calls the image's TLS callbacks with `reason` (e.g. `DLL_PROCESS_ATTACH`).

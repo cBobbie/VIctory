@@ -100,6 +100,17 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    if std::env::var("VICTORY_NO_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1") {
+        // The stale timestamp's `jae` to the fatal write becomes two NOPs.
+        let (rva, expect) = victory_game::WATCHDOG_STALE;
+        let mut with = expect;
+        with[4..].copy_from_slice(&[0x90, 0x90]);
+        if image.patch(rva, &expect, &with)? {
+            println!("watchdog       off (VICTORY_NO_TITLE_WATCHDOG)");
+        } else {
+            println!("watchdog       not found in this build; left on");
+        }
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();

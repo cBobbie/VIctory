@@ -17,6 +17,13 @@ pub struct KnownBuild {
 /// Builds we support. Empty until the executable is available.
 pub const KNOWN_BUILDS: &[KnownBuild] = &[];
 
+/// The game's hang watchdog: a thread that ends the game (a write to
+/// address 0) when one of the timestamps it watches has gone stale for
+/// longer than its limit. Debugging slows the host GPU past that limit.
+/// v1.0.2.1 (title 7952987A): `vucomiss xmm8, xmm7` (elapsed against the
+/// limit), then `jae` to the end, at this offset.
+pub const WATCHDOG_STALE: (usize, [u8; 6]) = (0x0221_5BD8, [0xC5, 0x78, 0x2E, 0xC7, 0x73, 0x2E]);
+
 /// Looks up a build by the BLAKE3 hash of its executable.
 pub fn identify(blake3_hex: &str) -> Option<&'static KnownBuild> {
     KNOWN_BUILDS
