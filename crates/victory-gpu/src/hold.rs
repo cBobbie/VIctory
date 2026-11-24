@@ -80,6 +80,17 @@ impl State {
             if awaited {
                 count("... while the title waits on a fence signal held behind them");
             }
+            // Watch when (if ever) the value comes: a late writer or none.
+            let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+            for &l in lists {
+                if let Some(list) = crate::list::host_list(l as This) {
+                    for (at, reference) in list.waits() {
+                        if !reached(at, reference) && late.len() < 256 {
+                            late.push((at, reference, Instant::now()));
+                        }
+                    }
+                }
+            }
         }
         self.busy.insert(key);
         if let Op::Run(lists) = &held.op {
@@ -255,6 +266,8 @@ fn start_timer() {
             .spawn(|| {
                 loop {
                     std::thread::sleep(Duration::from_millis(10));
+                    #[cfg(feature = "diagnostics")]
+                    watch_late();
                     let ran = std::panic::catch_unwind(|| drain(true, false));
                     if ran.is_err() {
                         tracing::warn!("held submissions: a release failed; holding stops");
@@ -266,6 +279,34 @@ fn start_timer() {
             });
         if spawned.is_err() {
             NO_HOLD.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Diagnostics: the waits of held submissions run without them, with when
+/// they were given up on.
+#[cfg(feature = "diagnostics")]
+static LATE: LazyLock<Mutex<Vec<(usize, u64, Instant)>>> = LazyLock::new(Mutex::default);
+
+/// Diagnostics: counts how long given-up waits took to be met, if at all.
+#[cfg(feature = "diagnostics")]
+fn watch_late() {
+    let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    late.retain(|&(at, reference, since)| {
+        let waited = since.elapsed();
+        if reached(at, reference) {
+            count(match waited.as_millis() {
+                0..500 => "given-up waits met within 0.5 s more",
+                500..2000 => "given-up waits met within 0.5-2 s more",
+                2000..10000 => "given-up waits met within 2-10 s more",
+                _ => "given-up waits met after 10 s more",
+            });
+            false
+        } else if waited >= Duration::from_secs(30) {
+            count("given-up waits never met (30 s)");
+            false
+        } else {
+            true
         }
     });
 }
