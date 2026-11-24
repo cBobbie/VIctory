@@ -1254,7 +1254,7 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, address: u64, comparison: u32, reference: u64) {
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     // Diagnostics: how often the title orders work after a memory value
     // this skips waiting for.
     #[cfg(feature = "diagnostics")]
@@ -1270,8 +1270,35 @@ extern "system" fn wait_value(_: This, address: u64, comparison: u32, reference:
                 "GPU wait for a memory value skipped"
             );
         }
+        // Whether the wait would have passed when the list runs (lists run
+        // in submission order, each to completion): comparison 7 is
+        // greater-or-equal (D3D12_COMPARISON_FUNC), on 32 bits.
+        if comparison == 7
+            && let Some(list) = host_list(this)
+        {
+            list.defer(move || {
+                static UNMET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let mut word = [0u8; 4];
+                if !crate::host::read_into(address as *const u8, &mut word) {
+                    return;
+                }
+                let value = u64::from(u32::from_le_bytes(word));
+                if value < reference {
+                    let n = UNMET.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(
+                            n,
+                            address = format_args!("{address:#x}"),
+                            value,
+                            reference,
+                            "a skipped GPU wait was not met when its list ran"
+                        );
+                    }
+                }
+            });
+        }
     }
-    let _ = (address, comparison, reference);
+    let _ = (this, address, comparison, reference);
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
