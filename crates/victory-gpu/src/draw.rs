@@ -689,8 +689,6 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
-        self.dump_dispatch(x, y, z);
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
@@ -718,6 +716,10 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // After the binding's refreshes, so the inspection sees what the
+        // GPU reads.
+        #[cfg(feature = "diagnostics")]
+        self.dump_dispatch(Some(list), x, y, z);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1021,7 +1023,7 @@ impl State {
     /// they read through tables, its range and first 16 dwords as recorded
     /// (u32 and f32): what sizes and counts its code loads.
     #[cfg(feature = "diagnostics")]
-    fn dump_dispatch(&self, x: u32, y: u32, z: u32) {
+    fn dump_dispatch(&self, list: Option<&HostList>, x: u32, y: u32, z: u32) {
         static WANTED: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
             std::env::var("VICTORY_DUMP_DISPATCH").ok().map(|h| h.trim().to_ascii_lowercase())
         });
@@ -1060,6 +1062,29 @@ impl State {
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
             let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+            // What the GPU will read: the host copy once refreshed.
+            if let Some(list) = list
+                && let Some(shadow) = crate::shadow::find(address, len.max(1))
+            {
+                let (slot, offset) = (u.slot, u.table_offset_dwords);
+                list.defer_inspect(move || {
+                    let bytes = shadow.host_bytes(address, 64);
+                    let words: Vec<u32> = bytes
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                        .collect();
+                    tracing::warn!(
+                        slot,
+                        offset,
+                        address = format_args!("{address:#x}"),
+                        host = format_args!("{:#x}", shadow.gpu(address)),
+                        ?words,
+                        "  ... the GPU's copy at submission"
+                    );
+                });
+            } else {
+                tracing::warn!(address = format_args!("{address:#x}"), "  ... no host copy holds it");
+            }
             tracing::warn!(
                 kind = ?u.kind,
                 slot = u.slot,

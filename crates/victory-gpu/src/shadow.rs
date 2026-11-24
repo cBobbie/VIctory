@@ -117,6 +117,16 @@ impl Shadow {
         address - self.start
     }
 
+    /// Diagnostics: up to `len` bytes of the copy at title `address`, as
+    /// the GPU reads them.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        let n = (self.left(address) as usize).min(len);
+        let at = (address - self.start) as usize;
+        // SAFETY: inside the mapping.
+        unsafe { std::slice::from_raw_parts(self.data.add(at), n) }.to_vec()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

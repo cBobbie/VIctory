@@ -429,6 +429,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Diagnostics: looks at host copies as the GPU will read them (after
+    /// the refreshes recorded before it).
+    #[cfg(feature = "diagnostics")]
+    Inspect(Box<dyn Fn() + Send>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1286,6 +1290,13 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Diagnostics: `work` runs at submission once the refreshes recorded
+    /// before it are done, seeing host copies as the GPU will.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_inspect(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Inspect(Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -1327,6 +1338,12 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(work) => {
+                    batch.flush();
+                    work();
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
