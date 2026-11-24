@@ -510,7 +510,7 @@ impl<'a> Lower<'a> {
                     }
                     d = idom[d];
                 };
-                if ms.lds_bytes == 0 || dominated {
+                if ms.lds_bytes == 0 || dominated || !super::mesh_barriers() {
                     no_barrier.insert(b);
                 }
             }

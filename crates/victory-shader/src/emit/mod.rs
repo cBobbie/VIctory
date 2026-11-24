@@ -124,6 +124,19 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether mesh programs keep their group barriers: with the
+/// `diagnostics` feature, `VICTORY_MESH_NO_BARRIERS=1` drops them all, to
+/// show whether a barrier some threads of a group never reach is what hangs
+/// the host (the LDS exchanges they order then race). Part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn mesh_barriers() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        !(cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_MESH_NO_BARRIERS").is_ok_and(|v| v.trim() == "1"))
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
