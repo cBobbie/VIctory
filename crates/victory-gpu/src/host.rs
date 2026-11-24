@@ -597,6 +597,12 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // The bytes shaders start from in every range they write, once per
+        // copy (`Shadow::snapshot`).
+        let written = writable(runs);
+        for shadow in &written {
+            shadow.snapshot();
+        }
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -674,23 +680,9 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        for shadow in &written {
+            let n = shadow.copy_back_all();
+            COPY_BACK[1].fetch_add(n as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -2066,6 +2058,22 @@ pub(crate) fn transition(
             }),
         },
     }
+}
+
+/// The host copies whose ranges shaders of `runs` write, each once.
+fn writable(runs: &[&HostList]) -> Vec<std::sync::Arc<crate::shadow::Shadow>> {
+    let mut out: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+    // One list's lock at a time: a submission may name a list twice.
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, ..) = step
+                && !out.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow))
+            {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    out
 }
 
 /// A window of the given client size, owned by its own message thread.

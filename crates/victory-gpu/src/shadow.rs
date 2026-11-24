@@ -40,9 +40,25 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The copy's bytes before the submission ran, over the ranges its
+    /// shaders write merged (offsets, disjoint, in order): what the GPU wrote
+    /// differs.
+    before: Mutex<Vec<(usize, Vec<u8>)>>,
+}
+
+/// Ranges merged where they overlap or touch: disjoint, in order, empty
+/// ones dropped.
+fn merge(ranges: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+    let mut r: Vec<(usize, usize)> = ranges.filter(|&(a, b)| a < b).collect();
+    r.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(r.len());
+    for (a, b) in r {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -143,41 +159,40 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// write this range; no refresh copies title memory over it until it is
+    /// copied back. Its bytes are kept by [`Shadow::snapshot`].
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
-        let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+    }
+
+    /// The submission's writable ranges merged (offsets in the copy,
+    /// disjoint, in order).
+    fn merged(&self) -> Vec<(usize, usize)> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        merge(pending.iter().map(|&(a, b)| self.inside(a, b - a)))
+    }
+
+    /// Once the submission's preparation is done: keeps the bytes of every
+    /// range its shaders write, each byte once however many dispatches
+    /// declare it (the world declares overlapping views of its 174 MB heap
+    /// dozens of times), in reused memory (fresh snapshots cost ~2.3
+    /// million page faults per world frame). Ranges declared writable are
+    /// not refreshed after their declaration, so the bytes are those the
+    /// shaders start from.
+    pub(crate) fn snapshot(&self) {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
+        for (_, bytes) in before.drain(..) {
+            give_back(bytes);
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
+        for (from, to) in self.merged() {
+            let mut kept = pooled(to - from);
+            // SAFETY: inside the mapping.
+            kept.extend_from_slice(unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) });
+            before.push((from, kept));
         }
-        *before = Some((start, grown));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -185,19 +200,14 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    /// records (a fence list read as -1, title+0x4e9b54a). Each byte of the
+    /// merged ranges once. Returns the bytes written.
+    pub(crate) fn copy_back_all(&self) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        for (from, before) in snapshot.drain(..) {
+            let to = from + before.len();
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -246,16 +256,11 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
+            give_back(before);
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
-        }
+        // The submission is done with every range it declared (one
+        // submission runs at a time).
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         written
     }
 
@@ -497,3 +502,16 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+#[cfg(test)]
+mod tests {
+    use super::merge;
+
+    #[test]
+    fn writable_ranges_merge_into_disjoint_ones() {
+        let r = [(10, 20), (0, 5), (15, 30), (30, 40), (50, 50), (45, 60), (55, 58)];
+        assert_eq!(merge(r.into_iter()), vec![(0, 5), (10, 40), (45, 60)]);
+        assert_eq!(merge(std::iter::empty()), vec![]);
+    }
+}
+
