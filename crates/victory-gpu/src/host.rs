@@ -301,6 +301,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The list's copy of indirect arguments to clamp (`indirect`), grown
+    /// as needed; in the common state between executions.
+    arguments: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -481,6 +484,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                arguments: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1128,6 +1132,25 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A buffer of the list's for `len` bytes of indirect arguments, in the
+    /// common state. One execution at a time uses it (`indirect`).
+    pub(crate) fn arguments(&self, len: u64) -> Option<ID3D12Resource> {
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, size)) = arguments.as_ref()
+            && *size >= len
+        {
+            return Some(buffer.clone());
+        }
+        let size = len.next_power_of_two().max(1 << 16);
+        let (buffer, _) = host()?.shared_buffer(size)?;
+        name(&buffer, || "indirect arguments".into());
+        // Earlier executions in this recording may still read the old one.
+        if let Some((old, _)) = arguments.replace((buffer.clone(), size)) {
+            self.keep(&old);
+        }
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.

@@ -139,57 +139,77 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// Records, in `list`, a copy of `records` records of `kind` (PC argument
+/// numbering) `stride` bytes apart at `offset` in the title buffer copy
+/// `source`, and their clamp: the list's argument buffer, ready to be read
+/// as arguments from offset 0. Replaces the list's compute root signature
+/// and pipeline (callers bind theirs after). `None` if the clamp is not
+/// available.
+///
+/// Title buffers stay in the common state and move out of it implicitly
+/// (vertex, index, constant and argument reads in one list), so their
+/// state at this point is not known and no barrier may name them: the
+/// clamp works on a buffer of ours, whose states are.
 pub(crate) fn bound(
     list: &HostList,
-    buffer: &ID3D12Resource,
-    gpu: u64,
+    source: &ID3D12Resource,
+    offset: u64,
     (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+) -> Option<ID3D12Resource> {
+    let c = clamp()?;
+    let budget = list.budget()?;
+    if !stride.is_multiple_of(4) {
+        return None;
     }
+    let len = u64::from(stride) * u64::from(records.max(1));
+    let args = list.arguments(len)?;
     let l = &list.list;
     let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    // SAFETY: an open list; our root signature, pipeline and buffers, and a
+    // live title buffer copy the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(
+                &args,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ]);
+        l.CopyBufferRegion(&args, 0, source, offset, len);
+        l.ResourceBarrier(&[transition(
+            &args,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootUnorderedAccessView(1, args.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
-                buffer,
+                &args,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
     }
-    true
+    Some(args)
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+/// After the execution: the argument buffer `bound` returned back to the
+/// common state, where the next execution expects it.
+pub(crate) fn done(list: &HostList, args: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
-            buffer,
+            args,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
         )])
     };
 }
