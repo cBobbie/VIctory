@@ -327,6 +327,16 @@ impl State {
         }
     }
 
+    /// Table `slot` starts at a title slot the host heap does not have.
+    fn past_host_heap(&self, compute: bool, slot: u8) -> bool {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return false;
+        };
+        self.heap_of(table)
+            .and_then(|heap| Some((heap.host()?, heap.index(table)?)))
+            .is_some_and(|(host, index)| index >= host.count())
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -492,6 +502,19 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        // The title's slots past a capped host heap have no
+                        // host slot: a shader given that offset reads past
+                        // the heap's end (garbage descriptors on NVIDIA; the
+                        // device hangs, #71). Such a draw is dropped (#550).
+                        None if u.root == RootType::Table
+                            && self.past_host_heap(compute, u.slot) =>
+                        {
+                            once!(
+                                slot = u.slot,
+                                "a draw or dispatch dropped: its table lies past the host heap"
+                            );
+                            return false;
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
