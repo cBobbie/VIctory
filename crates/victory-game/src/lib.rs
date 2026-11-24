@@ -18,11 +18,25 @@ pub struct KnownBuild {
 pub const KNOWN_BUILDS: &[KnownBuild] = &[];
 
 /// The game's hang watchdog: a thread that ends the game (a write to
-/// address 0) when one of the timestamps it watches has gone stale for
-/// longer than its limit. Debugging slows the host GPU past that limit.
-/// v1.0.2.1 (title 7952987A): `vucomiss xmm8, xmm7` (elapsed against the
-/// limit), then `jae` to the end, at this offset.
-pub const WATCHDOG_STALE: (usize, [u8; 6]) = (0x0221_5BD8, [0xC5, 0x78, 0x2E, 0xC7, 0x73, 0x2E]);
+/// address 0) when one of the timestamps it watches goes stale past its
+/// limit, or when the game's progress stamp stays the same for 30 of its
+/// checks. Debugging slows the host GPU past both. Each patch is (offset,
+/// the bytes there, their replacement) for v1.0.2.1 (title 7952987A): the
+/// conditional jump to the end becomes NOPs.
+pub const WATCHDOG: [(usize, &[u8], &[u8]); 2] = [
+    // `vucomiss xmm8, xmm7` (elapsed against the limit); `jae` to the end.
+    (
+        0x0221_5BD8,
+        &[0xC5, 0x78, 0x2E, 0xC7, 0x73, 0x2E],
+        &[0xC5, 0x78, 0x2E, 0xC7, 0x90, 0x90],
+    ),
+    // `cmp r15, rax; jne` (progress made); `dec ebp; je` to the end.
+    (
+        0x0221_5C69,
+        &[0x49, 0x39, 0xC7, 0x75, 0xD6, 0xFF, 0xCD, 0x74, 0x04],
+        &[0x49, 0x39, 0xC7, 0x75, 0xD6, 0xFF, 0xCD, 0x90, 0x90],
+    ),
+];
 
 /// Looks up a build by the BLAKE3 hash of its executable.
 pub fn identify(blake3_hex: &str) -> Option<&'static KnownBuild> {

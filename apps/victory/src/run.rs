@@ -101,15 +101,14 @@ pub fn run(
         return Ok(());
     }
     if std::env::var("VICTORY_NO_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1") {
-        // The stale timestamp's `jae` to the fatal write becomes two NOPs.
-        let (rva, expect) = victory_game::WATCHDOG_STALE;
-        let mut with = expect;
-        with[4..].copy_from_slice(&[0x90, 0x90]);
-        if image.patch(rva, &expect, &with)? {
-            println!("watchdog       off (VICTORY_NO_TITLE_WATCHDOG)");
-        } else {
-            println!("watchdog       not found in this build; left on");
+        let mut patched = 0;
+        for (rva, expect, with) in victory_game::WATCHDOG {
+            patched += usize::from(image.patch(rva, expect, with)?);
         }
+        println!(
+            "watchdog       {patched} of {} checks off (VICTORY_NO_TITLE_WATCHDOG)",
+            victory_game::WATCHDOG.len()
+        );
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
