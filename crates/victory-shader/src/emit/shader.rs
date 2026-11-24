@@ -306,11 +306,29 @@ impl Shader {
     }
 
     /// A descriptor heap handle, annotated with `props`.
-    pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+    /// `slots`: [`super::Target::view_slots`].
+    pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        props: (u32, u32),
+        slots: u32,
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
+        };
+        let index = if sampler || slots == 0 {
+            index
+        } else {
+            // The empty view of the kind the handle is annotated with.
+            let (kind, uav) = (props.0 & 0xFF, props.0 & 0x1000 != 0);
+            let fallback = slots + kind + if uav { 16 } else { 0 };
+            let (n, empty) = (self.m.i32(slots), self.m.i32(fallback));
+            let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, n);
+            self.m.select(block, inside, index, empty)
         };
         let (s, n) = (self.m.bool(sampler), self.m.bool(false));
         let h = self.op(

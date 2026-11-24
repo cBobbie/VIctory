@@ -180,6 +180,7 @@ pub fn run(
         target = emit::Target {
             lanes_min,
             lanes_max,
+            view_slots: 0,
         };
     }
     if target != emit::Target::ANY {

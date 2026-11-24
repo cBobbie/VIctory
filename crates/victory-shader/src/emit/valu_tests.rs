@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_for(body, super::Target::ANY)
+}
+
+fn build_valu_cs_for(body: &[u32], target: super::Target) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -136,7 +140,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: super::Target::ANY,
+        target,
         console_cf: false,
     })
     .expect("lower");
@@ -237,6 +241,21 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+#[test]
+fn heap_indices_inside_the_view_bound_read_their_own_view() {
+    // With a view bound, the heap index of the result UAV (0) is compared
+    // against it and kept; the result matches the unbounded translation.
+    let words = [0xcc0a4000, 0x1a0202f8]; // v_pk_add_u16 v0, 0x3e22f983, v1
+    let target = super::Target {
+        view_slots: 1_000_000,
+        ..super::Target::ANY
+    };
+    let shader = build_valu_cs_for(&words, target);
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0x3e22_f983, "{backend}");
+    });
 }
 
 #[test]

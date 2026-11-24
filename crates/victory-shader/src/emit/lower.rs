@@ -3574,7 +3574,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let h = self.s.heap_handle(self.cur, index, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, props, self.x.target.view_slots);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -3643,7 +3643,7 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, props, self.x.target.view_slots))
             }
         }
     }

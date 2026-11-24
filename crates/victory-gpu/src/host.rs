@@ -473,6 +473,7 @@ impl Host {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
+                    view_slots: 0,
                 }
             } else {
                 victory_shader::emit::Target::ANY

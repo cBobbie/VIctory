@@ -124,6 +124,12 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Empty views the host keeps right after a view heap's first
+/// [`Target::view_slots`], one per resource kind a handle annotates:
+/// `view_slots + kind` for shader views, `view_slots + 16 + kind` for
+/// unordered access views (DXIL resource kinds 1..=13).
+pub const FALLBACK_VIEWS: u32 = 32;
+
 /// Whether mesh programs keep their group barriers: with the
 /// `diagnostics` feature, `VICTORY_MESH_NO_BARRIERS=1` drops them all, to
 /// show whether a barrier some threads of a group never reach is what hangs
@@ -212,6 +218,15 @@ pub struct UserData {
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    /// The view slots of the host's smallest shader-visible view heap, with
+    /// [`FALLBACK_VIEWS`] empty views after them (0: unknown, no guard). A
+    /// translated heap index at or past it reads the empty view of the kind
+    /// the shader expects instead of memory past the heap's end, which
+    /// faults or hangs the host GPU. Indices come from title data the
+    /// translation cannot check (bindless materials): this keeps such a
+    /// read from hanging; why the index is out of range is a separate
+    /// question.
+    pub view_slots: u32,
 }
 
 impl Target {
@@ -220,6 +235,7 @@ impl Target {
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        view_slots: 0,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -227,11 +243,12 @@ impl Target {
         (self.lanes_min..=self.lanes_max).contains(&lanes)
     }
 
-    /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
+    /// Everything that changes a translation, as bytes, for cache keys.
+    pub fn key(self) -> [u8; 12] {
+        let mut k = [0; 12];
         k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8..].copy_from_slice(&self.view_slots.to_le_bytes());
         k
     }
 }
@@ -861,10 +878,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        view_slots: 0,
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        view_slots: 0,
     };
 
     #[test]

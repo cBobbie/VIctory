@@ -197,6 +197,13 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // The last slots of a view heap hold the empty views translated
+        // shaders read for indices past the others (`fallback_views`).
+        const FALLBACKS: u32 = victory_shader::emit::FALLBACK_VIEWS;
+        let dynamic = if sampler { extra } else { extra - FALLBACKS };
+        if !sampler {
+            record_view_slots(count + dynamic);
+        }
         let strides = if sampler {
             None
         } else {
@@ -207,11 +214,11 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; dynamic as usize])),
             strides,
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -226,11 +233,77 @@ impl HostHeap {
             ms = started.elapsed().as_millis(),
             "host descriptor heap made null"
         );
+        if !sampler {
+            h.fallback_views(count + dynamic);
+        }
         Some(h)
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
+    /// From slot `first`: an empty view per DXIL resource kind (1..=13),
+    /// shader views then unordered access views 16 slots on (see
+    /// `victory_shader::emit::FALLBACK_VIEWS`).
+    fn fallback_views(&self, first: u32) {
+        let Some(host) = host() else { return };
+        let at = |k: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.cpu + ((first + k) * self.step) as usize,
+        };
+        // DXIL kinds to D3D12 view dimensions (shader view, unordered view).
+        let dims = |kind: u32| match kind {
+            1 => (2, Some(2)),   // 1D
+            2 => (4, Some(4)),   // 2D
+            3 => (6, None),      // 2D MS
+            4 => (8, Some(8)),   // 3D
+            5 => (9, None),      // cube
+            6 => (3, Some(3)),   // 1D array
+            7 => (5, Some(5)),   // 2D array
+            8 => (7, None),      // 2D MS array
+            9 => (10, None),     // cube array
+            _ => (1, Some(1)),   // buffers
+        };
+        for kind in 1..=13 {
+            let (srv, uav) = dims(kind);
+            match kind {
+                13 => {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                    // SAFETY: a slot of our heap; a zero location makes a null view.
+                    unsafe { host.device.CreateConstantBufferView(Some(&desc), at(kind)) };
+                }
+                10..=12 => null_buffer_view(at(kind)),
+                _ => {
+                    let mut words = [0u32; 10];
+                    words[1] = srv;
+                    null_like(&words, at(kind));
+                }
+            }
+            let desc = match uav {
+                Some(1) => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: 1,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                },
+                Some(d) => null_uav_desc(Some(d)),
+                None => continue,
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at(16 + kind),
+                )
+            };
+        }
+    }
+
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
         let Some(host) = host() else { return Ok(()) };
@@ -903,6 +976,23 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A view heap with `slots` view slots before its fallback views.
+// shortcut: the smallest heap bounds every heap; a title binding a larger
+// heap with indices past the smallest needs the bound heap's size.
+fn record_view_slots(slots: u32) {
+    use std::sync::atomic::Ordering;
+    let _ = VIEW_SLOTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(if n == 0 { slots } else { n.min(slots) })
+    });
+}
+
+/// The view slots translations bound heap indices by (0: no heap yet).
+pub(crate) fn view_slots() -> u32 {
+    VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

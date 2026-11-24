@@ -288,6 +288,7 @@ fn console_flow_is_for_one_console_wave_per_group() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        view_slots: 0,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
     assert!(emit_for(&program(&body, 128), nvidia).is_err());
