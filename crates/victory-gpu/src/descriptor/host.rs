@@ -134,6 +134,33 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// The dynamic slots of a capped view heap: [`MIN_DYNAMIC`], or
+/// `VICTORY_CAPPED_DYNAMIC` (local experiment, clamped to
+/// [`MIN_DYNAMIC`]..=[`DYNAMIC`]) at the cost of the title's highest slots.
+fn capped_dynamic() -> u32 {
+    parse_capped_dynamic(std::env::var("VICTORY_CAPPED_DYNAMIC").ok().as_deref())
+}
+
+fn parse_capped_dynamic(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(MIN_DYNAMIC, |n| n.clamp(MIN_DYNAMIC, DYNAMIC))
+}
+
+#[cfg(test)]
+mod capped_dynamic_tests {
+    use super::{DYNAMIC, MIN_DYNAMIC, parse_capped_dynamic};
+
+    #[test]
+    fn capped_dynamic_defaults_and_clamps() {
+        assert_eq!(parse_capped_dynamic(None), MIN_DYNAMIC);
+        assert_eq!(parse_capped_dynamic(Some("abc")), MIN_DYNAMIC);
+        assert_eq!(parse_capped_dynamic(Some("1")), MIN_DYNAMIC);
+        assert_eq!(parse_capped_dynamic(Some("200000")), 200_000);
+        assert_eq!(parse_capped_dynamic(Some("99999999")), DYNAMIC);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -172,8 +199,9 @@ impl HostHeap {
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let dynamic = capped_dynamic();
+                    tracing::warn!(error = %e, count, dynamic, "host view heap capped at {PORTABLE_VIEWS}");
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - dynamic, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
