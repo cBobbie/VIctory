@@ -100,6 +100,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    // Diagnostics only: a game that would end itself spins instead, which
+    // only debugging (slow GPU validation, stack dumps) wants.
+    #[cfg(feature = "diagnostics")]
     if std::env::var("VICTORY_NO_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1") {
         let mut patched = 0;
         for (rva, expect, with) in victory_game::WATCHDOG {

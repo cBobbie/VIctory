@@ -568,8 +568,12 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        fence_monitor::start();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            fence_monitor::submitted(*submitted);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -580,7 +584,11 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        #[cfg(feature = "diagnostics")]
+                        fence_monitor::waiting(true);
                         WaitForSingleObject(self.event, INFINITE);
+                        #[cfg(feature = "diagnostics")]
+                        fence_monitor::waiting(false);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -2116,3 +2124,61 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 }
+
+/// Diagnostics: whether the GPU is still finishing work, logged every 10 s
+/// whatever the title does (the frame-rate line stops with the frames).
+/// `completed` is the host fence's value, `submitted` the last value
+/// signalled; a submission the CPU has waited on for long while the GPU
+/// completes nothing is a stalled GPU, a still CPU with both equal is not.
+#[cfg(feature = "diagnostics")]
+mod fence_monitor {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+    /// Milliseconds since `EPOCH` when the current wait began; 0: none.
+    static WAIT_FROM: AtomicU64 = AtomicU64::new(0);
+
+    fn epoch() -> Instant {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    fn now_ms() -> u64 {
+        epoch().elapsed().as_millis() as u64 + 1
+    }
+
+    pub(super) fn submitted(value: u64) {
+        SUBMITTED.store(value, Ordering::Relaxed);
+    }
+
+    pub(super) fn waiting(on: bool) {
+        WAIT_FROM.store(if on { now_ms() } else { 0 }, Ordering::Relaxed);
+    }
+
+    pub(super) fn start() {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            epoch();
+            let _ = std::thread::Builder::new()
+                .name("victory-fence-monitor".into())
+                .spawn(|| {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(10));
+                        let Some(host) = super::host() else { return };
+                        // SAFETY: a plain query of our fence.
+                        let completed = unsafe { host.fence.GetCompletedValue() };
+                        let from = WAIT_FROM.load(Ordering::Relaxed);
+                        let waiting_ms = if from == 0 { 0 } else { now_ms().saturating_sub(from) };
+                        tracing::info!(
+                            completed,
+                            submitted = SUBMITTED.load(Ordering::Relaxed),
+                            waiting_ms,
+                            "gpu fence"
+                        );
+                    }
+                });
+        });
+    }
+}
+
