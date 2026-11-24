@@ -147,7 +147,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if gbv_mode().is_some()
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -158,7 +158,7 @@ fn create() -> windows::core::Result<Host> {
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
                     );
                 }
-                tracing::info!("GPU-based validation on");
+                tracing::info!(mode = gbv_mode(), "GPU-based validation on");
             }
         }
         // Diagnostics: device-removed data (the command that faulted, the
@@ -184,6 +184,30 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Unguarded shader patching by default: guarded patching makes the
+        // largest translated shaders take minutes each to compile (the world
+        // waited on a handful for over ten minutes, 2026-11-24). Unguarded
+        // still reports bad accesses, but lets them run.
+        if let Some(mode) = gbv_mode()
+            && let Ok(d) = device.cast::<ID3D12DebugDevice1>()
+        {
+            let settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS {
+                MaxMessagesPerCommandList: 0,
+                DefaultShaderPatchMode: if mode == "guarded" {
+                    D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
+                } else {
+                    D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION
+                },
+                PipelineStateCreateFlags: D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_NONE,
+            };
+            if let Err(e) = d.SetDebugParameter(
+                D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS,
+                (&raw const settings).cast(),
+                size_of_val(&settings) as u32,
+            ) {
+                tracing::warn!(error = %e, mode, "GPU-based validation mode not set");
+            }
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -329,6 +353,21 @@ type States = std::collections::HashMap<
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
+/// GPU-based validation (`VICTORY_D3D12_GBV`, with the debug layer):
+/// `None` off; `guarded` when set to that (bad accesses blocked, slow to
+/// compile), else `unguarded` (reported, still run).
+pub(crate) fn gbv_mode() -> Option<&'static str> {
+    static MODE: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let v = std::env::var("VICTORY_D3D12_GBV").ok()?;
+        Some(if v.trim().eq_ignore_ascii_case("guarded") {
+            "guarded"
+        } else {
+            "unguarded"
+        })
+    })
+}
+
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

@@ -48,7 +48,14 @@ struct Library {
 // mutex that holds the library.
 unsafe impl Send for Library {}
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library file: one per validation mode, since pipelines made under
+/// GPU-based validation are patched and those made without it are not.
+fn library_file() -> String {
+    match crate::host::gbv_mode() {
+        None => "host-pipelines.bin".into(),
+        Some(mode) => format!("host-pipelines-gbv-{mode}.bin"),
+    }
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -60,7 +67,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .and_then(|d| std::fs::read(d.join(library_file())).ok())
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -170,7 +177,7 @@ pub(crate) fn save(now: bool) {
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
