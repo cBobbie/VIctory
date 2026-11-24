@@ -129,6 +129,7 @@ pub fn loop_limit() -> u32 {
 /// `view_slots + kind` for shader views, `view_slots + 16 + kind` for
 /// unordered access views (DXIL resource kinds 1..=13).
 pub const FALLBACK_VIEWS: u32 = 32;
+const _: () = assert!(16 + 13 < FALLBACK_VIEWS);
 
 /// Whether mesh programs keep their group barriers: with the
 /// `diagnostics` feature, `VICTORY_MESH_NO_BARRIERS=1` drops them all, to

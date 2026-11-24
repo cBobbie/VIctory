@@ -325,6 +325,8 @@ impl Shader {
         } else {
             // The empty view of the kind the handle is annotated with.
             let (kind, uav) = (props.0 & 0xFF, props.0 & 0x1000 != 0);
+            // The host fills fallbacks for these kinds only.
+            debug_assert!((1..=13).contains(&kind), "a heap handle of kind {kind}");
             let fallback = slots + kind + if uav { 16 } else { 0 };
             let (n, empty) = (self.m.i32(slots), self.m.i32(fallback));
             let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, n);

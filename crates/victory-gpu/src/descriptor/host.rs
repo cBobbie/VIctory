@@ -270,7 +270,27 @@ impl HostHeap {
                     // SAFETY: a slot of our heap; a zero location makes a null view.
                     unsafe { host.device.CreateConstantBufferView(Some(&desc), at(kind)) };
                 }
-                10..=12 => null_buffer_view(at(kind)),
+                10..=12 => {
+                    let (format, stride, flags) = buffer_null(kind);
+                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                NumElements: 1,
+                                StructureByteStride: stride,
+                                Flags: D3D12_BUFFER_SRV_FLAGS(flags),
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+                    unsafe {
+                        host.device
+                            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at(kind))
+                    };
+                }
                 _ => {
                     let mut words = [0u32; 10];
                     words[1] = srv;
@@ -278,17 +298,21 @@ impl HostHeap {
                 }
             }
             let desc = match uav {
-                Some(1) => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_TYPELESS,
-                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_UAV {
-                            NumElements: 1,
-                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                            ..Default::default()
+                Some(1) => {
+                    let (format, stride, flags) = buffer_null(kind);
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 1,
+                                StructureByteStride: stride,
+                                Flags: D3D12_BUFFER_UAV_FLAGS(flags),
+                                ..Default::default()
+                            },
                         },
-                    },
-                },
+                    }
+                }
                 Some(d) => null_uav_desc(Some(d)),
                 None => continue,
             };
@@ -978,11 +1002,27 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// A null buffer view's format, stride and flags for DXIL kind 10 (typed),
+/// 11 (raw) or 12 (structured), so the view's type is the one the shader
+/// declares; the RAW flag has the same value for shader and unordered views.
+// shortcut: structured nulls have a 4-byte stride; a shader declaring
+// another stride reads its zeros through a view of another stride.
+fn buffer_null(kind: u32) -> (DXGI_FORMAT, u32, i32) {
+    match kind {
+        10 => (DXGI_FORMAT_R32_UINT, 0, 0),
+        12 => (DXGI_FORMAT_UNKNOWN, 4, 0),
+        _ => (DXGI_FORMAT_R32_TYPELESS, 0, D3D12_BUFFER_SRV_FLAG_RAW.0),
+    }
+}
+
 static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// A view heap with `slots` view slots before its fallback views.
-// shortcut: the smallest heap bounds every heap; a title binding a larger
-// heap with indices past the smallest needs the bound heap's size.
+// shortcut: the smallest heap bounds every heap. Where heaps differ in size
+// (uncapped hosts, e.g. AMD), indices of a larger heap past the smallest
+// read empty views, and its own slots at the smallest's fallback places are
+// not empty; a fix keys the bound to the bound heap. Shaders translated
+// before the first heap (boot) have no bound.
 fn record_view_slots(slots: u32) {
     use std::sync::atomic::Ordering;
     let _ = VIEW_SLOTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
