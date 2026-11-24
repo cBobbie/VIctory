@@ -807,6 +807,16 @@ type Kept = Option<ID3D12Resource>;
 /// device for one that is not), and it reads and writes the copy every other
 /// view of that memory uses. Translated shaders read buffer views raw unless
 /// they index them (`victory-shader`, "Buffer views in the heap").
+/// The element count of a view starting at element `first` of a host copy
+/// `copy` bytes long, in `unit`-byte elements, so it ends inside the copy:
+/// `count` (0: the rest of the copy) or fewer; none if nothing is left.
+fn clamp_to_copy(first: u64, count: u32, copy: u64, unit: u64) -> Option<u32> {
+    let left = (copy / unit.max(1)).saturating_sub(first);
+    let left = u32::try_from(left).unwrap_or(u32::MAX);
+    let n = if count == 0 { left } else { count.min(left) };
+    (n > 0).then_some(n)
+}
+
 fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
     if stride == 0 || !stride.is_multiple_of(4) {
         return None;
@@ -861,18 +871,12 @@ fn buffer_srv(
         );
         return None;
     }
-    // A view never reaches past its host copy: counted from the view's
-    // start in its own units (dwords for a raw view).
+    // A view never reaches past its host copy: the copy's length in the
+    // view's units (dwords for a raw view) less the view's first element,
+    // which counts from the copy's start (title FirstElement included).
     let unit = if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 { 4 } else { element };
-    let remaining = shadow.left(address) / unit;
-    buffer.NumElements = if buffer.NumElements == 0 {
-        remaining as u32
-    } else {
-        buffer.NumElements.min(remaining as u32)
-    };
-    if buffer.NumElements == 0 {
-        return None;
-    }
+    let copy = offset + shadow.left(address);
+    buffer.NumElements = clamp_to_copy(buffer.FirstElement, buffer.NumElements, copy, unit)?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -938,18 +942,12 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    // A view never reaches past its host copy: counted from the view's
-    // start in its own units (dwords for a raw view).
+    // A view never reaches past its host copy: the copy's length in the
+    // view's units (dwords for a raw view) less the view's first element,
+    // which counts from the copy's start (title FirstElement included).
     let unit = if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 { 4 } else { element };
-    let remaining = shadow.left(address) / unit;
-    buffer.NumElements = if buffer.NumElements == 0 {
-        remaining as u32
-    } else {
-        buffer.NumElements.min(remaining as u32)
-    };
-    if buffer.NumElements == 0 {
-        return None;
-    }
+    let copy = offset + shadow.left(address);
+    buffer.NumElements = clamp_to_copy(buffer.FirstElement, buffer.NumElements, copy, unit)?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1165,6 +1163,10 @@ fn buffer_null(kind: u32) -> (DXGI_FORMAT, u32, i32) {
 static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// A view heap with `slots` view slots before its fallback views.
+// The bound includes the dynamic range: re-made tables live there and
+// shaders reach them through the same heap index. A title index past the
+// title slots but inside the dynamic range reads another draw's view
+// (wrong data, not a hang); raising VICTORY_CAPPED_DYNAMIC widens that.
 // shortcut: the smallest heap bounds every heap. Where heaps differ in size
 // (uncapped hosts, e.g. AMD), indices of a larger heap past the smallest
 // read empty views, and its own slots at the smallest's fallback places are
@@ -1408,6 +1410,19 @@ mod tests {
     /// A structured view whose start in its host copy is not on an element
     /// becomes the raw view of the same bytes, where those start 16-byte
     /// aligned.
+    #[test]
+    fn views_end_inside_their_host_copy() {
+        use super::clamp_to_copy;
+        // 1024-byte copy, 32-byte elements, view from element 10: 22 left.
+        assert_eq!(clamp_to_copy(10, 30, 1024, 32), Some(22));
+        // Raw: from dword 20 of a 1024-byte copy, 236 dwords left.
+        assert_eq!(clamp_to_copy(20, 240, 1024, 4), Some(236));
+        assert_eq!(clamp_to_copy(0, 0, 1024, 32), Some(32));
+        assert_eq!(clamp_to_copy(0, 8, 1024, 32), Some(8));
+        assert_eq!(clamp_to_copy(32, 1, 1024, 32), None);
+        assert_eq!(clamp_to_copy(40, 1, 1024, 32), None);
+    }
+
     #[test]
     fn structured_views_off_an_element_are_raw_views_of_the_same_bytes() {
         // (offset in the copy, first element, elements, stride)
