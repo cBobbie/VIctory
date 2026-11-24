@@ -217,6 +217,11 @@ pub(crate) fn flush(list: This) {
 fn start_timer() {
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
+        // `VICTORY_HOLD=0`: nothing is held (lists run as submitted).
+        if std::env::var("VICTORY_HOLD").is_ok_and(|v| v.trim() == "0") {
+            NO_HOLD.store(true, Ordering::Relaxed);
+            return;
+        }
         let spawned = std::thread::Builder::new()
             .name("victory-held-lists".into())
             .spawn(|| {
