@@ -72,6 +72,14 @@ impl State {
             && !met(lists)
         {
             count("held submissions run without their waits met");
+            // The title's CPU waiting on a signal held behind this run: the
+            // thread that would submit the writer may be that one.
+            let awaited = self.held.get(&key).is_some_and(|d| {
+                d.iter().any(|h| matches!(h.op, Op::Signal(f, v) if crate::fence::awaited(f as This, v)))
+            });
+            if awaited {
+                count("... while the title waits on a fence signal held behind them");
+            }
         }
         self.busy.insert(key);
         if let Op::Run(lists) = &held.op {

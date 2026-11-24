@@ -75,6 +75,15 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+/// Whether a CPU thread waits on `this` reaching `value` or less (an event
+/// set on completion not yet reached).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn awaited(this: This, value: u64) -> bool {
+    let fence = fence(this);
+    let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    waiters.iter().any(|&(wanted, _)| wanted <= value)
+}
+
 /// The fence's current value (what `GetCompletedValue` returns).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn value(this: This) -> u64 {
