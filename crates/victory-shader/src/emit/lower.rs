@@ -450,13 +450,14 @@ impl<'a> Lower<'a> {
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            // for a group of one console wave.
+            // LDS is shared in the console's lockstep there too: a barrier
+            // follows each access (`inst`).
+            wants_console_flow = (console_lanes || one_wave && s.lds_dwords > 0)
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"));
             if x.console_cf {
@@ -2504,7 +2505,21 @@ impl<'a> Lower<'a> {
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
-            Fields::Ds { .. } => self.ds(inst, b, i),
+            Fields::Ds { .. } => {
+                let r = self.ds(inst, b, i);
+                let lds = !(name.starts_with("ds_swizzle") || name.contains("permute"));
+                if r.is_ok() && lds && self.console_cf {
+                    // The console's halves share LDS in lockstep, without
+                    // barriers; ours are two host waves. Every thread runs
+                    // every block in the console flow, so a group barrier
+                    // after each access orders it as the console does.
+                    let mode = self.s.m.i32(1 | 8);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                }
+                r
+            }
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
