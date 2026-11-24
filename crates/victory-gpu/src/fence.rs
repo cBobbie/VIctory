@@ -76,6 +76,7 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 /// The fence's current value (what `GetCompletedValue` returns).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn value(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }

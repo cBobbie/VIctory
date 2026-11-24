@@ -272,6 +272,9 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    // A held submission of the list runs first (`crate::hold`).
+    #[cfg(windows)]
+    crate::hold::flush(this);
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -289,6 +292,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    // A held submission of the list runs before it is rewritten.
+    #[cfg(windows)]
+    crate::hold::flush(this);
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };

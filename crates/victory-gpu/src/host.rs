@@ -1167,15 +1167,13 @@ impl HostList {
         self.deferred().waits.push((at, reference));
     }
 
-    /// Whether every wait the list recorded is met in memory now; one at an
-    /// unreadable address counts as met.
-    pub(crate) fn waits_met(&self) -> bool {
-        self.deferred().waits.iter().all(|&(at, reference)| {
-            let mut word = [0u8; 4];
-            !read_into(at as *const u8, &mut word) || u64::from(u32::from_le_bytes(word)) >= reference
-        })
+    /// The waits the list recorded: address, reference.
+    pub(crate) fn waits(&self) -> Vec<(usize, u64)> {
+        self.deferred().waits.clone()
     }
 
+    /// The largest value this list writes to `dst` when it has run, if it
+    /// writes one there (a wait the list satisfies itself).
     pub(crate) fn own_write(&self, dst: usize) -> Option<u64> {
         self.deferred()
             .writes

@@ -9,9 +9,15 @@
 //!
 //! A held submission whose waits stay unmet for [`LIMIT`] runs anyway, as
 //! before holding: a writer that never comes (dropped work, a write by the
-//! CPU) or queues that wait on each other cannot freeze the title.
+//! CPU) or queues that wait on each other cannot freeze the title. Held
+//! work also runs at once before a present, and before a list it holds is
+//! reset or released (D3D12 allows both right after submitting).
+//!
+//! Lists run outside the lock; a queue running some is busy, and its later
+//! submissions queue behind, so each queue keeps its order.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
@@ -32,121 +38,202 @@ struct Held {
     op: Op,
 }
 
-/// Each queue's held submissions, by queue address, in submission order.
-static QUEUES: LazyLock<Mutex<HashMap<usize, VecDeque<Held>>>> = LazyLock::new(Mutex::default);
-
-fn queues() -> MutexGuard<'static, HashMap<usize, VecDeque<Held>>> {
-    QUEUES.lock().unwrap_or_else(|e| e.into_inner())
+#[derive(Default)]
+struct State {
+    /// Each queue's held submissions, by queue address, in order.
+    held: HashMap<usize, VecDeque<Held>>,
+    /// Queues whose work runs now on some thread.
+    busy: HashSet<usize>,
 }
 
-fn holding(q: &HashMap<usize, VecDeque<Held>>, queue: usize) -> bool {
-    q.get(&queue).is_some_and(|d| !d.is_empty())
+impl State {
+    fn holding(&self, queue: usize) -> bool {
+        self.busy.contains(&queue) || self.held.get(&queue).is_some_and(|d| !d.is_empty())
+    }
+
+    /// Takes the next held op of a queue not busy that may run (`force`:
+    /// one held past [`LIMIT`] too; `all`: any), marking the queue busy.
+    fn take(&mut self, force: bool, all: bool) -> Option<(usize, Op)> {
+        let key = self.held.iter().find_map(|(&key, d)| {
+            let front = d.front()?;
+            let ready = all
+                || match &front.op {
+                    Op::Signal(..) => true,
+                    Op::Run(lists) => met(lists) || force && front.since.elapsed() >= LIMIT,
+                };
+            (ready && !self.busy.contains(&key)).then_some(key)
+        })?;
+        let held = self.held.get_mut(&key)?.pop_front()?;
+        #[cfg(feature = "diagnostics")]
+        if let Op::Run(lists) = &held.op
+            && !met(lists)
+        {
+            count("held submissions run without their waits met");
+        }
+        self.busy.insert(key);
+        Some((key, held.op))
+    }
 }
 
-/// Whether every wait the lists recorded is met in memory now.
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
+/// No timer thread could start: nothing is held (it could not be released).
+static NO_HOLD: AtomicBool = AtomicBool::new(false);
+
+fn state() -> MutexGuard<'static, State> {
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the 32-bit value at `at` has reached `reference` (counters wrap).
+fn reached(at: usize, reference: u64) -> bool {
+    let mut word = [0u8; 4];
+    if !crate::host::read_into(at as *const u8, &mut word) {
+        return true;
+    }
+    at_least(u32::from_le_bytes(word), reference)
+}
+
+/// Whether a 32-bit counter at `value` has reached `reference`'s low 32
+/// bits, across a wrap (within half the range).
+fn at_least(value: u32, reference: u64) -> bool {
+    value.wrapping_sub(reference as u32) as i32 >= 0
+}
+
+/// Whether every wait of `lists` is met: in memory now, or by a list
+/// before it in the same submission (whose writes land once all have run).
 fn met(lists: &[usize]) -> bool {
-    lists.iter().all(|&l| {
-        crate::list::host_list(l as This).is_none_or(crate::host::HostList::waits_met)
+    lists.iter().enumerate().all(|(i, &l)| {
+        let Some(list) = crate::list::host_list(l as This) else {
+            return true;
+        };
+        list.waits().into_iter().all(|(at, reference)| {
+            reached(at, reference)
+                || lists[..i].iter().any(|&e| {
+                    crate::list::host_list(e as This)
+                        .and_then(|e| e.own_write(at))
+                        .is_some_and(|v| at_least(v as u32, reference))
+                })
+        })
     })
 }
 
-/// Runs `lists` submitted on `queue` now, or holds them behind what the
-/// queue already holds or until their waits are met.
-pub(crate) fn submit(queue: This, lists: &[This], run: fn(&[This])) {
-    start_timer(run);
-    let lists: Vec<usize> = lists.iter().map(|&l| l as usize).collect();
-    let mut q = queues();
-    let key = queue as usize;
-    if !holding(&q, key) && met(&lists) {
-        // Outside the lock, as before holding: signals on other queues do
-        // not wait for these lists to run.
-        drop(q);
-        run(&as_this(&lists));
-        q = queues();
-    } else {
-        #[cfg(feature = "diagnostics")]
-        count("submissions held for a wait another queue's work meets");
-        q.entry(key).or_default().push_back(Held {
-            since: Instant::now(),
-            op: Op::Run(lists),
-        });
+fn perform(op: Op) {
+    match op {
+        Op::Run(lists) => {
+            let lists: Vec<This> = lists.iter().map(|&l| l as This).collect();
+            crate::queue::run(&lists);
+        }
+        Op::Signal(fence, value) => {
+            let _ = crate::fence::signal(fence as This, value);
+        }
     }
-    drain(&mut q, run, false);
 }
 
-/// Signals `fence` now, or after what `queue` holds runs.
-pub(crate) fn signal(queue: This, fence: This, value: u64) -> HRESULT {
-    let mut q = queues();
+/// Runs what can run, each op outside the lock, until nothing can.
+fn drain(force: bool, all: bool) {
+    loop {
+        let next = state().take(force, all);
+        let Some((key, op)) = next else { return };
+        perform(op);
+        state().busy.remove(&key);
+    }
+}
+
+/// Runs `lists` submitted on `queue` now, or holds them behind what the
+/// queue holds or runs, or until their waits are met.
+pub(crate) fn submit(queue: This, lists: &[This]) {
+    start_timer();
+    let lists: Vec<usize> = lists.iter().map(|&l| l as usize).collect();
     let key = queue as usize;
-    if holding(&q, key) {
-        q.entry(key).or_default().push_back(Held {
+    {
+        let mut s = state();
+        if NO_HOLD.load(Ordering::Relaxed) || !s.holding(key) && met(&lists) {
+            s.busy.insert(key);
+            drop(s);
+            perform(Op::Run(lists));
+            state().busy.remove(&key);
+        } else {
+            #[cfg(feature = "diagnostics")]
+            count("submissions held for a wait another queue's work meets");
+            s.held.entry(key).or_default().push_back(Held {
+                since: Instant::now(),
+                op: Op::Run(lists),
+            });
+        }
+    }
+    drain(false, false);
+}
+
+/// Signals `fence` now, or after what `queue` holds or runs.
+pub(crate) fn signal(queue: This, fence: This, value: u64) -> HRESULT {
+    let key = queue as usize;
+    let mut s = state();
+    if s.holding(key) {
+        s.held.entry(key).or_default().push_back(Held {
             since: Instant::now(),
             op: Op::Signal(fence as usize, value),
         });
+        drop(s);
+        drain(false, false);
         return S_OK;
     }
-    drop(q);
+    drop(s);
     crate::fence::signal(fence, value)
 }
 
-fn as_this(lists: &[usize]) -> Vec<This> {
-    lists.iter().map(|&l| l as This).collect()
+/// Runs everything held, waiting for queues busy on other threads (before a
+/// present: the frame's work first).
+pub(crate) fn flush_all() {
+    loop {
+        drain(false, true);
+        let s = state();
+        if s.held.values().all(VecDeque::is_empty) {
+            return;
+        }
+        drop(s);
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
-/// Runs held submissions that can run, in each queue's order, until none
-/// can; with `force`, a queue's first one held past [`LIMIT`] runs too.
-fn drain(q: &mut HashMap<usize, VecDeque<Held>>, run: fn(&[This]), force: bool) {
-    loop {
-        let mut progress = false;
-        for held in q.values_mut() {
-            while let Some(front) = held.front() {
-                let ready = match &front.op {
-                    Op::Run(lists) => {
-                        let late = force && front.since.elapsed() >= LIMIT;
-                        #[cfg(feature = "diagnostics")]
-                        if late && !met(lists) {
-                            count("held submissions run without their waits met");
-                        }
-                        late || met(lists)
-                    }
-                    Op::Signal(..) => true,
-                };
-                if !ready {
-                    break;
-                }
-                let Some(front) = held.pop_front() else { break };
-                match front.op {
-                    Op::Run(lists) => run(&as_this(&lists)),
-                    Op::Signal(fence, value) => {
-                        let _ = crate::fence::signal(fence as This, value);
-                    }
-                }
-                progress = true;
-            }
-        }
-        if !progress {
-            return;
+/// Runs held work up to and including `list`'s submissions, before the
+/// title resets or releases it.
+pub(crate) fn flush(list: This) {
+    let l = list as usize;
+    let holds = |s: &State| {
+        s.held
+            .values()
+            .any(|d| d.iter().any(|h| matches!(&h.op, Op::Run(ls) if ls.contains(&l))))
+    };
+    while holds(&state()) {
+        drain(false, true);
+        if holds(&state()) {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
 
-/// A thread that runs submissions held past [`LIMIT`], when no later
-/// submission comes to release them.
-fn start_timer(run: fn(&[This])) {
+/// A thread that runs held submissions whose waits were met by something
+/// other than a submission (a CPU write, a fence signal) and those held
+/// past [`LIMIT`]. Without it nothing is held.
+fn start_timer() {
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("victory-held-lists".into())
-            .spawn(move || {
+            .spawn(|| {
                 loop {
                     std::thread::sleep(Duration::from_millis(10));
-                    let mut q = queues();
-                    let late = q.values().any(|d| d.front().is_some_and(|h| h.since.elapsed() >= LIMIT));
-                    if late {
-                        drain(&mut q, run, true);
+                    let ran = std::panic::catch_unwind(|| drain(true, false));
+                    if ran.is_err() {
+                        tracing::warn!("held submissions: a release failed; holding stops");
+                        NO_HOLD.store(true, Ordering::Relaxed);
+                        let _ = std::panic::catch_unwind(flush_all);
+                        return;
                     }
                 }
             });
+        if spawned.is_err() {
+            NO_HOLD.store(true, Ordering::Relaxed);
+        }
     });
 }
 
@@ -159,5 +246,21 @@ fn count(what: &'static str) {
     *n += 1;
     if n.is_power_of_two() {
         tracing::info!(n = *n, "{what}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::at_least;
+
+    #[test]
+    fn counters_reach_their_reference_across_a_wrap() {
+        assert!(at_least(1096, 1096));
+        assert!(at_least(1097, 1096));
+        assert!(!at_least(1095, 1096));
+        assert!(at_least(2, 0xFFFF_FFFE));
+        assert!(!at_least(0xFFFF_FFFD, 0xFFFF_FFFE));
+        // A 64-bit reference compares by its low 32 bits.
+        assert!(at_least(5, 0x1_0000_0005));
     }
 }

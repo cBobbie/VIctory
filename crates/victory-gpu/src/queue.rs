@@ -120,7 +120,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        crate::hold::submit(this, lists, run);
+        crate::hold::submit(this, lists);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -131,7 +131,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 
 /// Runs title lists on the host now, each to completion.
 #[cfg(windows)]
-fn run(lists: &[This]) {
+pub(crate) fn run(lists: &[This]) {
     if let Some(host) = crate::host::host() {
         let mut skipped = 0;
         let host_lists: Vec<_> = lists
@@ -300,6 +300,9 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // The frame's held work first (`crate::hold`).
+    #[cfg(windows)]
+    crate::hold::flush_all();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
