@@ -1016,13 +1016,11 @@ impl State {
         }
     }
 
-    /// What a draw's shaders read, one line per used resource (diagnostics
-    /// builds).
-    #[cfg(feature = "diagnostics")]
     /// Diagnostics (`VICTORY_DUMP_DISPATCH=<shader hash>`): the first eight
     /// dispatches of that shader log their user data and, per buffer view
     /// they read through tables, its range and first 16 dwords as recorded
     /// (u32 and f32): what sizes and counts its code loads.
+    #[cfg(feature = "diagnostics")]
     fn dump_dispatch(&self, x: u32, y: u32, z: u32) {
         static WANTED: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
             std::env::var("VICTORY_DUMP_DISPATCH").ok().map(|h| h.trim().to_ascii_lowercase())
@@ -1075,6 +1073,9 @@ impl State {
         }
     }
 
+    /// What a draw's shaders read, one line per used resource (diagnostics
+    /// builds).
+    #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
