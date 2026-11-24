@@ -23,8 +23,18 @@ use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_OK, This};
 
-/// How long a held submission waits for its writer before it runs anyway.
-const LIMIT: Duration = Duration::from_millis(100);
+/// How long a held submission waits for its writer before it runs anyway:
+/// 100 ms, or `VICTORY_HOLD_MS`. In the world every writer given up on came
+/// later (16+ within 0.5 s, 16+ within 2 s, 8+ within 10 s; none never,
+/// 2026-11-24): a longer limit keeps the console's order at the cost of
+/// time while frames take seconds.
+static LIMIT: LazyLock<Duration> = LazyLock::new(|| {
+    let ms = std::env::var("VICTORY_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(100);
+    Duration::from_millis(ms)
+});
 
 enum Op {
     /// Title lists (addresses).
@@ -62,7 +72,7 @@ impl State {
             let ready = all
                 || match &front.op {
                     Op::Signal(..) => true,
-                    Op::Run(lists) => met(lists) || force && front.since.elapsed() >= LIMIT,
+                    Op::Run(lists) => met(lists) || force && front.since.elapsed() >= *LIMIT,
                 };
             (ready && !self.busy.contains(&key)).then_some(key)
         })?;
