@@ -71,6 +71,8 @@ pub(crate) struct Shader {
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
+    /// Heap handles made with a non-uniform index.
+    pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -125,6 +127,7 @@ impl Shader {
             root_srvs: Vec::new(),
             stride_table: None,
             flags: 0,
+            nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -305,13 +308,15 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
+    /// A descriptor heap handle, annotated with `props`; `nonuniform` when
+    /// the index may differ between lanes (`NonUniformResourceIndex`).
     /// `slots`: [`super::Target::view_slots`].
     pub fn heap_handle(
         &mut self,
         block: usize,
         index: V,
         sampler: bool,
+        nonuniform: bool,
         props: (u32, u32),
         slots: u32,
     ) -> V {
@@ -332,7 +337,8 @@ impl Shader {
             let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, n);
             self.m.select(block, inside, index, empty)
         };
-        let (s, n) = (self.m.bool(sampler), self.m.bool(false));
+        self.nonuniform_handles += u32::from(nonuniform);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
             "createHandleFromHeap",
