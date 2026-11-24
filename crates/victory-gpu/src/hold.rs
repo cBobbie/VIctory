@@ -44,6 +44,9 @@ struct State {
     held: HashMap<usize, VecDeque<Held>>,
     /// Queues whose work runs now on some thread.
     busy: HashSet<usize>,
+    /// Lists that run now (held work taken off its queue), which a reset or
+    /// release must wait for.
+    running: HashSet<usize>,
 }
 
 impl State {
@@ -71,7 +74,20 @@ impl State {
             count("held submissions run without their waits met");
         }
         self.busy.insert(key);
+        if let Op::Run(lists) = &held.op {
+            self.running.extend(lists);
+        }
         Some((key, held.op))
+    }
+
+    /// The queue is done with `op`'s work.
+    fn done(&mut self, key: usize, op: &Op) {
+        self.busy.remove(&key);
+        if let Op::Run(lists) = op {
+            for l in lists {
+                self.running.remove(l);
+            }
+        }
     }
 }
 
@@ -116,13 +132,13 @@ fn met(lists: &[usize]) -> bool {
     })
 }
 
-fn perform(op: Op) {
+fn perform(op: &Op) {
     match op {
         Op::Run(lists) => {
             let lists: Vec<This> = lists.iter().map(|&l| l as This).collect();
             crate::queue::run(&lists);
         }
-        Op::Signal(fence, value) => {
+        &Op::Signal(fence, value) => {
             let _ = crate::fence::signal(fence as This, value);
         }
     }
@@ -133,8 +149,8 @@ fn drain(force: bool, all: bool) {
     loop {
         let next = state().take(force, all);
         let Some((key, op)) = next else { return };
-        perform(op);
-        state().busy.remove(&key);
+        perform(&op);
+        state().done(key, &op);
     }
 }
 
@@ -148,9 +164,11 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         let mut s = state();
         if NO_HOLD.load(Ordering::Relaxed) || !s.holding(key) && met(&lists) {
             s.busy.insert(key);
+            let op = Op::Run(lists);
             drop(s);
-            perform(Op::Run(lists));
-            state().busy.remove(&key);
+            perform(&op);
+            s = state();
+            s.busy.remove(&key);
         } else {
             #[cfg(feature = "diagnostics")]
             count("submissions held for a wait another queue's work meets");
@@ -186,7 +204,7 @@ pub(crate) fn flush_all() {
     loop {
         drain(false, true);
         let s = state();
-        if s.held.values().all(VecDeque::is_empty) {
+        if s.held.values().all(VecDeque::is_empty) && s.running.is_empty() {
             return;
         }
         drop(s);
@@ -198,10 +216,12 @@ pub(crate) fn flush_all() {
 /// title resets or releases it.
 pub(crate) fn flush(list: This) {
     let l = list as usize;
+    // Held, or taken off its queue and running on another thread.
     let holds = |s: &State| {
-        s.held
-            .values()
-            .any(|d| d.iter().any(|h| matches!(&h.op, Op::Run(ls) if ls.contains(&l))))
+        s.running.contains(&l)
+            || s.held
+                .values()
+                .any(|d| d.iter().any(|h| matches!(&h.op, Op::Run(ls) if ls.contains(&l))))
     };
     while holds(&state()) {
         drain(false, true);
