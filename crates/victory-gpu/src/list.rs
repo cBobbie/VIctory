@@ -1276,6 +1276,16 @@ extern "system" fn wait_value(this: This, address: u64, comparison: u32, referen
         if comparison == 7
             && let Some(list) = host_list(this)
         {
+            // Written earlier in this same list: the GPU runs the list in
+            // order, so the wait holds without blocking.
+            if list.own_write(address as usize).is_some_and(|v| v >= reference) {
+                static OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = OWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(n, "a skipped GPU wait its own list satisfies");
+                }
+                return;
+            }
             list.defer(move || {
                 static UNMET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let mut word = [0u8; 4];

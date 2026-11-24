@@ -1156,6 +1156,20 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// The largest value this list writes to `dst` when it has run, if it
+    /// writes one there (diagnostics: a wait the list satisfies itself).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn own_write(&self, dst: usize) -> Option<u64> {
+        self.deferred()
+            .writes
+            .iter()
+            .filter_map(|&(at, what, _)| match what {
+                crate::queue::Written::Value(v) if at == dst => Some(v),
+                _ => None,
+            })
+            .max()
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
