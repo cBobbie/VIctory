@@ -238,6 +238,9 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// Console flow: IR blocks whose branches each 32-lane half may decide
+    /// alone ([`half_local_blocks`]).
+    half_local: Vec<bool>,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -287,6 +290,78 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
+/// Console flow, blocks whose branches each 32-lane half of the console
+/// wave may decide alone: the blocks of a loop (back edge to the end of its
+/// body, by program order) in which nothing synchronizes the group (a
+/// barrier, LDS, a whole-wave section, a lane read across lanes, a mask
+/// read as data or an SCC of a mask used as data: each exchanges between
+/// the halves through group barriers) and no branch leaves except to the
+/// block after it. Lanes there only read and write their own data, so a
+/// half whose lanes are done may leave while the other iterates; both meet
+/// at the same next exchange. Saves the two group barriers per iteration
+/// of each loop test (the world's depth reduction: about 3 s a frame).
+fn half_local_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+    let n = p.blocks.len();
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for w in &inst.writes {
+                def.insert(w.1, (b, i));
+            }
+        }
+    }
+    // Masks read as data: exchanged where they are written.
+    let mut data_masks: HashSet<Value> = HashSet::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if reads_mask_as_data(st, inst) {
+                data_masks.extend(inst.reads.iter().map(|r| r.1).filter(|&v| is_mask(v)));
+            }
+        }
+    }
+    let syncs = |b: usize| -> bool {
+        if !super::wave::sections(p, b).is_empty() {
+            return true;
+        }
+        let insts = &p.blocks[b].insts;
+        insts.iter().enumerate().any(|(k, inst)| {
+            let name = inst.name();
+            let last = k + 1 == insts.len();
+            name == "s_barrier"
+                || matches!(inst.fields, Fields::Ds { .. })
+                || matches!(name, "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32")
+                || name.starts_with("v_permlane")
+                || reads_mask_as_data(st, inst)
+                || inst.writes.iter().any(|w| data_masks.contains(&w.1))
+                // An SCC of a mask operation read other than by the branch.
+                || !(last && name.starts_with("s_cbranch"))
+                    && inst.read(Reg::Scc).and_then(|v| def.get(&v)).is_some_and(|&(db, di)| {
+                        p.blocks[db].insts[di]
+                            .writes
+                            .iter()
+                            .any(|w| matches!(w.0, Reg::S(_)) && st.masks.contains_key(&w.1))
+                    })
+        })
+    };
+    let mut out = vec![false; n];
+    for e in 0..n {
+        let Exit::Branch { taken: t, .. } = p.blocks[e].exit else { continue };
+        if t > e {
+            continue;
+        }
+        let safe = (t..=e).all(|x| {
+            !syncs(x) && p.blocks[x].exit.successors().iter().all(|&y| t <= y && y <= e + 1)
+        });
+        if safe {
+            for x in out.iter_mut().take(e + 1).skip(t) {
+                *x = true;
+            }
+        }
+    }
+    out
+}
+
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -629,6 +704,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            half_local: Vec::new(),
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -1056,6 +1132,9 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        if self.console_cf {
+            self.half_local = half_local_blocks(p, self.x.st);
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -7240,7 +7319,11 @@ impl<'a> Lower<'a> {
         let (any, set) = match name {
             "s_cbranch_scc0" | "s_cbranch_scc1" => {
                 let v = inst.read(Reg::Scc).ok_or("a branch's SCC")?;
-                let scc = self.scc_bit(v)?;
+                let scc = if self.half_local.get(b).copied().unwrap_or(false) {
+                    self.scc_bit_half(v)?
+                } else {
+                    self.scc_bit(v)?
+                };
                 (scc, name == "s_cbranch_scc1")
             }
             "s_cbranch_vccz" | "s_cbranch_vccnz" | "s_cbranch_execz" | "s_cbranch_execnz" => {
@@ -7256,7 +7339,7 @@ impl<'a> Lower<'a> {
                     .masks
                     .get(&lo)
                     .ok_or("a branch on an untracked mask")?;
-                (self.any_lane(m)?, name.ends_with("nz"))
+                (self.branch_any_lane(m)?, name.ends_with("nz"))
             }
             _ => return Err("a branch the console flow does not model"),
         };
@@ -7293,6 +7376,40 @@ impl<'a> Lower<'a> {
     }
 
     /// Console flow: whether `m` holds in some lane of the console wave.
+    /// Console flow: [`Self::any_lane`] for a branch; in a block whose
+    /// branches each half decides alone ([`half_local_blocks`]), whether
+    /// `m` holds in some lane of this host wave: no exchange, no barrier.
+    fn branch_any_lane(&mut self, m: Bool) -> Result<V, Why> {
+        if !self.half_local.get(self.cur_ir).copied().unwrap_or(false) {
+            return self.any_lane(m);
+        }
+        let c = self.cur;
+        let bit = self.boolean(m, c)?;
+        let word = self.ballot_word(c, bit);
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, pred::NE, word, z))
+    }
+
+    /// [`Self::scc_bit`] for a branch in a half-local block.
+    fn scc_bit_half(&mut self, v: Value) -> Result<V, Why> {
+        if let Some(&Val::Bit(x)) = self.vals.get(&v) {
+            return Ok(x);
+        }
+        let b = *self.def_block.get(&v).ok_or("an SCC from the program's start")?;
+        let inst = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))
+            .ok_or("an SCC without its instruction")?;
+        let mask = inst
+            .writes
+            .iter()
+            .filter(|w| matches!(w.0, Reg::S(_)))
+            .find_map(|w| self.x.st.masks.get(&w.1).copied())
+            .ok_or("an SCC the emitter did not compute")?;
+        self.branch_any_lane(mask)
+    }
+
     fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;

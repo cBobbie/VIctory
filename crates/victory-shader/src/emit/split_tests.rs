@@ -325,6 +325,33 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
     flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
 }
 
+/// A loop whose body reads no other lane, in a program that does after
+/// it: each 32-lane half decides its own loop exit (no group barrier per
+/// iteration, `half_local_blocks`), and lane t still loops t times. The
+/// halves run different numbers of iterations (up to 31 and 63) and meet
+/// at the read of lane 40 after the loop.
+#[test]
+fn halves_leave_a_loop_without_cross_lane_reads_on_their_own() {
+    let body = [
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz end
+        // loop:
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        // end:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xD760_0009,
+        0x0001_5102, // v_readlane_b32 s9, v2, 40
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    flow_case("loop t times, then read lane 40", &body, 64, |t| t + 40, false);
+}
+
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only
 /// rows 0 and 1 (lanes 0 to 31) write, so the upper half keeps its value
 /// although its host rows are 0 and 1 too.
