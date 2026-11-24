@@ -451,6 +451,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// In-list waits for a 32-bit value at an address to reach at least a
+    /// reference, that work before them in the list does not meet
+    /// (`crate::hold`).
+    waits: Vec<(usize, u64)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1157,8 +1161,21 @@ impl HostList {
     }
 
     /// The largest value this list writes to `dst` when it has run, if it
-    /// writes one there (diagnostics: a wait the list satisfies itself).
-    #[cfg(feature = "diagnostics")]
+    /// writes one there (a wait the list satisfies itself).
+    /// Records a wait for the 32-bit value at `at` to reach `reference`.
+    pub(crate) fn add_wait(&self, at: usize, reference: u64) {
+        self.deferred().waits.push((at, reference));
+    }
+
+    /// Whether every wait the list recorded is met in memory now; one at an
+    /// unreadable address counts as met.
+    pub(crate) fn waits_met(&self) -> bool {
+        self.deferred().waits.iter().all(|&(at, reference)| {
+            let mut word = [0u8; 4];
+            !read_into(at as *const u8, &mut word) || u64::from(u32::from_le_bytes(word)) >= reference
+        })
+    }
+
     pub(crate) fn own_write(&self, dst: usize) -> Option<u64> {
         self.deferred()
             .writes

@@ -1255,57 +1255,29 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
-    // Diagnostics: how often the title orders work after a memory value
-    // this skips waiting for.
+    // Comparison 7 is greater-or-equal (D3D12_COMPARISON_FUNC), on 32 bits:
+    // a counter another queue's work raises. Lists run as they are
+    // submitted, so a wait work earlier in this list does not meet is
+    // recorded for `crate::hold`, which runs the list once a write meets it.
+    #[cfg(windows)]
+    if comparison == 7
+        && let Some(list) = host_list(this)
+        && !list.own_write(address as usize).is_some_and(|v| v >= reference)
+    {
+        list.add_wait(address as usize, reference);
+    }
     #[cfg(feature = "diagnostics")]
     {
-        static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n.is_power_of_two() {
-            tracing::warn!(
+            tracing::info!(
                 n,
                 address = format_args!("{address:#x}"),
                 comparison,
                 reference,
-                "GPU wait for a memory value skipped"
+                "GPU waits for a memory value"
             );
-        }
-        // Whether the wait would have passed when the list runs (lists run
-        // in submission order, each to completion): comparison 7 is
-        // greater-or-equal (D3D12_COMPARISON_FUNC), on 32 bits.
-        if comparison == 7
-            && let Some(list) = host_list(this)
-        {
-            // Written earlier in this same list: the GPU runs the list in
-            // order, so the wait holds without blocking.
-            if list.own_write(address as usize).is_some_and(|v| v >= reference) {
-                static OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = OWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::info!(n, "a skipped GPU wait its own list satisfies");
-                }
-                return;
-            }
-            list.defer(move || {
-                static UNMET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let mut word = [0u8; 4];
-                if !crate::host::read_into(address as *const u8, &mut word) {
-                    return;
-                }
-                let value = u64::from(u32::from_le_bytes(word));
-                if value < reference {
-                    let n = UNMET.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n.is_power_of_two() {
-                        tracing::warn!(
-                            n,
-                            address = format_args!("{address:#x}"),
-                            value,
-                            reference,
-                            "a skipped GPU wait was not met when its list ran"
-                        );
-                    }
-                }
-            });
         }
     }
     let _ = (this, address, comparison, reference);

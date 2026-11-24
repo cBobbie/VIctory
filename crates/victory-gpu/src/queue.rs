@@ -110,15 +110,29 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Runs the lists' host lists and waits for them (decision 0007), in order
+/// with the title's in-list waits across queues (`crate::hold`).
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
+    if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::hold::submit(this, lists, run);
+        return;
+    }
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !ONCE.swap(true, Ordering::Relaxed) {
+        tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    }
+}
+
+/// Runs title lists on the host now, each to completion.
+#[cfg(windows)]
+fn run(lists: &[This]) {
+    if let Some(host) = crate::host::host() {
         let mut skipped = 0;
         let host_lists: Vec<_> = lists
             .iter()
@@ -142,11 +156,6 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         for &l in lists {
             crate::list::finished(l);
         }
-        return;
-    }
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
 }
 
@@ -175,11 +184,18 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    // After what the queue holds, if anything (`crate::hold`).
+    #[cfg(windows)]
+    return crate::hold::signal(this, fence, value);
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        crate::fence::signal(fence, value)
+    }
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
 extern "system" fn wait(_: This, fence: This, value: u64) -> HRESULT {
