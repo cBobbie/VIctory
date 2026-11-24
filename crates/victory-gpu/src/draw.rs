@@ -689,6 +689,8 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        self.dump_dispatch(x, y, z);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
@@ -1017,6 +1019,62 @@ impl State {
     /// What a draw's shaders read, one line per used resource (diagnostics
     /// builds).
     #[cfg(feature = "diagnostics")]
+    /// Diagnostics (`VICTORY_DUMP_DISPATCH=<shader hash>`): the first eight
+    /// dispatches of that shader log their user data and, per buffer view
+    /// they read through tables, its range and first 16 dwords as recorded
+    /// (u32 and f32): what sizes and counts its code loads.
+    fn dump_dispatch(&self, x: u32, y: u32, z: u32) {
+        static WANTED: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_DUMP_DISPATCH").ok().map(|h| h.trim().to_ascii_lowercase())
+        });
+        static DONE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let Some(wanted) = WANTED.as_deref() else { return };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let Some(stage) = p.stages.iter().find(|s| s.shader.hash == wanted) else { return };
+        if DONE.fetch_add(1, Ordering::Relaxed) >= 8 {
+            return;
+        }
+        let t = stage.translated();
+        let user: Vec<String> = t
+            .host
+            .user_data
+            .iter()
+            .map(|u| format!("u{}={:#x}", u.index, self.user_value(true, u.slot, u.root, u.dword)))
+            .collect();
+        tracing::warn!(groups = ?(x, y, z), ?user, "dispatch of {wanted}");
+        for u in &t.used {
+            let (RootType::Table, Some(Root::Table(table))) =
+                (u.root, self.roots_ref(true).get(usize::from(u.slot)))
+            else {
+                continue;
+            };
+            let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+            let Some((address, len)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) else {
+                continue;
+            };
+            let mut bytes = [0u8; 64];
+            let n = (len as usize).min(64);
+            if !crate::host::read_into(address as *const u8, &mut bytes[..n]) {
+                continue;
+            }
+            let words: Vec<u32> = bytes[..n]
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let floats: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+            tracing::warn!(
+                kind = ?u.kind,
+                slot = u.slot,
+                offset = u.table_offset_dwords,
+                address = format_args!("{address:#x}"),
+                len,
+                ?words,
+                ?floats,
+                "  buffer it reads"
+            );
+        }
+    }
+
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
