@@ -182,8 +182,32 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+extern "system" fn wait(_: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    // Diagnostics: a wait for a value the fence has not reached orders this
+    // queue's later work after work another queue has not submitted yet;
+    // running it now runs it before what it waits for.
+    #[cfg(feature = "diagnostics")]
+    {
+        static EARLY: AtomicU64 = AtomicU64::new(0);
+        let now = crate::fence::value(fence);
+        if now < value {
+            let n = EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    fence = format_args!("{fence:p}"),
+                    value,
+                    now,
+                    "queue waits for a fence value not reached yet: its work runs early"
+                );
+            }
+        }
+    }
+    let _ = value;
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {

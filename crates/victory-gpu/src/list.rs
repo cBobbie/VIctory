@@ -1254,7 +1254,25 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "system" fn wait_value(_: This, address: u64, comparison: u32, reference: u64) {
+    // Diagnostics: how often the title orders work after a memory value
+    // this skips waiting for.
+    #[cfg(feature = "diagnostics")]
+    {
+        static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(
+                n,
+                address = format_args!("{address:#x}"),
+                comparison,
+                reference,
+                "GPU wait for a memory value skipped"
+            );
+        }
+    }
+    let _ = (address, comparison, reference);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a

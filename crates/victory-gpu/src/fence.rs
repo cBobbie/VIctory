@@ -75,6 +75,10 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+/// The fence's current value (what `GetCompletedValue` returns).
+pub(crate) fn value(this: This) -> u64 {
+    fence(this).value.load(Ordering::Acquire)
+}
 extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
