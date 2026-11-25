@@ -162,6 +162,24 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes of the full-size "before" twins of copies in the card's memory
+/// (not window copies), which [`Shadow::card_make_before`] makes when
+/// shaders first write a copy.
+static TWIN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The card's memory the texture queue leaves for what copies of title
+/// buffers may still take (`resource::room`): the copies `card_limits`
+/// still allows and a twin of each, and the twins of the copies made that
+/// have none yet. A copy shaders write takes its size twice.
+#[cfg(windows)]
+pub(crate) fn card_reserve() -> u64 {
+    if !cards() {
+        return 0;
+    }
+    let copies = CARD_BYTES[0].load(Ordering::Relaxed);
+    (2 * card_limits().1).saturating_sub(copies + TWIN_BYTES.load(Ordering::Relaxed))
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -206,14 +224,14 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Only while the card has room: with this copy on it, use stays under
+    // the share the texture queue fills to (`resource::room`, nine tenths
+    // of the budget the system gives us). The textures leave room for the
+    // copies not made yet ([`card_reserve`]), so the copies fit whichever
+    // comes first; this was a fifth of the budget free, which textures
+    // loaded first (before the character bake) left none of on an 8 GB card.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * crate::resource::room_percent()
     {
         return None;
     }
@@ -1441,6 +1459,9 @@ impl Drop for Shadow {
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+                if !window {
+                    TWIN_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -2556,6 +2577,9 @@ impl Shadow {
         *before = make(card.size);
         if before.is_some() {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+            if !self.window {
+                TWIN_BYTES.fetch_add(card.size, Ordering::Relaxed);
+            }
         }
         before.is_some()
     }
