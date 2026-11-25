@@ -140,9 +140,9 @@ pub(crate) fn cards() -> bool {
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// most bytes of such copies (their "before" is the hashes of their pieces,
+/// [`card_hash_bytes`], not counted), both in bytes:
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
@@ -162,22 +162,16 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Bytes of the full-size "before" twins of copies in the card's memory
-/// (not window copies), which [`Shadow::card_make_before`] makes when
-/// shaders first write a copy.
-static TWIN_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// The card's memory the texture queue leaves for what copies of title
-/// buffers may still take (`resource::room`): the copies `card_limits`
-/// still allows and a twin of each, and the twins of the copies made that
-/// have none yet. A copy shaders write takes its size twice.
+/// The card's memory the texture queue leaves for copies of title buffers
+/// not made yet (`resource::room`): what `card_limits` allows them, less
+/// what they have. (A copy's "before" is its pieces' hashes,
+/// [`card_hash_bytes`]: 16 bytes for each 64 KiB, left out.)
 #[cfg(windows)]
 pub(crate) fn card_reserve() -> u64 {
     if !cards() {
         return 0;
     }
-    let copies = CARD_BYTES[0].load(Ordering::Relaxed);
-    (2 * card_limits().1).saturating_sub(copies + TWIN_BYTES.load(Ordering::Relaxed))
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -1459,9 +1453,6 @@ impl Drop for Shadow {
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
-                if !window {
-                    TWIN_BYTES.fetch_sub(card.size, Ordering::Relaxed);
-                }
             }
         }
     }
@@ -2577,9 +2568,6 @@ impl Shadow {
         *before = make(card.size);
         if before.is_some() {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
-            if !self.window {
-                TWIN_BYTES.fetch_add(card.size, Ordering::Relaxed);
-            }
         }
         before.is_some()
     }
