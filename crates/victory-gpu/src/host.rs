@@ -5562,19 +5562,95 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// The end of the run of committed, readable (or writable) pages that
+/// starts at `at`, cut at `end`. `None` if the page at `at` is not one.
+///
+/// The kernel calls cost 40 MB/s reading and 10 MB/s writing here: they walk
+/// the range page by page. One `VirtualQuery` per region is enough to know
+/// the bytes are there, and the copy is then memory speed. Title memory is
+/// view memory with holes, so this answers per run, not per range.
+fn mapped_run(at: usize, end: usize, write: bool) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut p = at;
+    while p < end {
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(p as _, &mut info, size_of_val(&info)) };
+        if size != size_of_val(&info) {
+            return (p > at).then_some(p);
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return (p > at).then_some(p);
+        }
+        let protect = info.Protect & 0xff;
+        let writable = matches!(protect, 0x04 | 0x08 | 0x40 | 0x80);
+        if info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || (write && !writable)
+        {
+            return (p > at).then_some(p);
+        }
+        p = next;
+    }
+    Some(end)
+}
+
+fn mapped_whole(at: usize, len: usize, write: bool) -> bool {
+    mapped_run(at, at.saturating_add(len), write) == Some(at.saturating_add(len))
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    // `VirtualQuery` walks the page tables to the region's end: ~0.6 ms in
+    // the title's big pools, where most copies are under a kilobyte. Only a
+    // large read is worth the question.
+    if len == 0 {
+        return true;
+    }
+    if len >= (256 << 10) && mapped_whole(src as usize, len, false) {
+        // SAFETY: every page of both ranges is committed and readable or
+        // writable (`mapped_whole`); `dst` is ours and writable.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveFast, len as u64);
+        return true;
+    }
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut done = 0;
+    let mut done = 0usize;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // kernel checks the source. `NtReadVirtualMemory` is the same kernel
+    // copy `ReadProcessMemory` wraps, without the wrapper's validation of
+    // both ranges (`VICTORY_COPY_MODE=plain` measured that wrapper as most
+    // of a copy's cost here: 14k copies of 18 KiB at ~84 MB/s).
+    let status = unsafe {
+        NtReadVirtualMemory(
+            GetCurrentProcess(),
+            src.cast(),
+            dst.cast(),
+            len,
+            &mut done,
+        )
+    };
+    status >= 0 && done == len
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there (a partial read is all it gives then).
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
+
     /// The kernel's write into a process's memory, `(process, address,
     /// bytes, length, written out)`: an NTSTATUS, negative when a page of
     /// the range is not there or not writable. It changes no protection.
@@ -5619,16 +5695,34 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
+    // Title memory is view memory with holes: copy the committed runs at
+    // memory speed and give the holes to the kernel, one piece at a time.
+    let mut at = dst as usize;
+    let end = at + len;
+    while at < end {
+        if let Some(to) = mapped_run(at, end, true) {
+            // SAFETY: the destination's pages are committed and writable
+            // (`mapped_run`), the source is our host copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.wrapping_add(at - dst as usize), at as *mut u8, to - at)
+            };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MoveFast, (to - at) as u64);
+            at = to;
+            continue;
+        }
+        let step = 64 << 10;
+        let to = ((at / step + 1) * step).min(end);
+        if !write(at, to - at) {
+            for_pieces(at, to - at, 4 << 10, |at, n| {
                 write(at, n);
             });
         }
-    });
+        at = to;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
