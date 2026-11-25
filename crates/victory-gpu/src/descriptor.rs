@@ -353,9 +353,10 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
-// A read-write lock: every draw looks views up on the title's recording
-// threads, while only new views and released resources change it (run
-// fb-x5: 21% of the process's samples were threads waiting on it as a mutex).
+/// Read far more often than written: every slot a draw reads through a
+/// table is looked up here, on several recording threads at once in the
+/// world. Readers share it; only a view not seen before (a new table entry
+/// or shape) and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
@@ -483,6 +484,12 @@ impl Views {
         Some(View::Placed(unordered, resource, desc))
     }
 
+    /// The record words of `view` as a table entry, if it has one.
+    fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
+        let &i = self.index.get(view)?;
+        Some([i, self.list[i as usize].1])
+    }
+
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
@@ -525,8 +532,10 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let known = VIEWS.read().unwrap_or_else(|e| e.into_inner()).shape_index.get(&shape).copied();
-                    if let Some(shape) = known.or_else(|| VIEWS.write().unwrap_or_else(|e| e.into_inner()).shape(shape)) {
+                    // Nearly every placed view has a shape seen before.
+                    let known = views_read().shape_index.get(&shape).copied();
+                    let shape = known.or_else(|| views_write().shape(shape));
+                    if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -535,13 +544,19 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    {
-        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(&i) = views.index.get(&view) {
-            return [i, views.list[i as usize].1];
-        }
+    // A view written before keeps its entry and generation.
+    if let Some(words) = views_read().entry_of(&view) {
+        return words;
     }
-    VIEWS.write().unwrap_or_else(|e| e.into_inner()).entry(view)
+    views_write().entry(view)
+}
+
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -555,7 +570,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -706,7 +721,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -782,12 +797,12 @@ pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.read().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
 }
