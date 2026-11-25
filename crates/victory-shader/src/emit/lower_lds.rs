@@ -16,7 +16,8 @@ pub(super) enum LdsUse {
     Read,
     Write,
     /// An atomic whose result in memory does not depend on the order the lanes run it, by
-    /// operation and type (`ds_add_u32` and `ds_add_rtn_u32` are one kind).
+    /// operation and type. Not the `_rtn` forms: the old value each lane gets back depends on
+    /// the order (a running total used as a slot number), so they count as writes.
     Atomic(String),
 }
 
@@ -26,8 +27,11 @@ pub(super) fn lds_use(name: &str) -> LdsUse {
     }
     let rest = name.strip_prefix("ds_").unwrap_or(name);
     let op = rest.split('_').next().unwrap_or("");
-    if matches!(op, "add" | "sub" | "min" | "max" | "and" | "or" | "xor") && !rest.contains("src2") {
-        return LdsUse::Atomic(rest.replace("_rtn", ""));
+    if matches!(op, "add" | "sub" | "min" | "max" | "and" | "or" | "xor")
+        && !rest.contains("src2")
+        && !rest.contains("_rtn")
+    {
+        return LdsUse::Atomic(rest.to_owned());
     }
     LdsUse::Write
 }
@@ -81,11 +85,17 @@ pub(super) fn lds_dwords(defs: &HashMap<Value, &Inst>, inst: &Inst) -> Option<Ve
     };
     let at: Vec<u32> = if name.contains("read2") || name.contains("write2") || name.contains("wrxchg2") {
         let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
-        vec![base + u32::from(*offset0) * scale, base + u32::from(*offset1) * scale]
+        let at = |o: u8| base.checked_add(u32::from(o).checked_mul(scale)?);
+        vec![at(*offset0)?, at(*offset1)?]
     } else {
-        vec![base + (u32::from(*offset0) | u32::from(*offset1) << 8)]
+        vec![base.checked_add(u32::from(*offset0) | u32::from(*offset1) << 8)?]
     };
-    Some(at.into_iter().flat_map(|a| (a / 4)..(a + 4 * width).div_ceil(4)).collect())
+    // An address past 4 GiB is not one the analysis can place: not known.
+    let mut dwords = Vec::new();
+    for a in at {
+        dwords.extend((a / 4)..a.checked_add(4 * width)?.div_ceil(4));
+    }
+    Some(dwords)
 }
 
 /// Whether two accesses of one region (a read and a write, or writes of different kinds) may

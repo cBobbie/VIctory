@@ -5,7 +5,8 @@ fn kinds() {
     assert_eq!(lds_use("ds_read_b32"), LdsUse::Read);
     assert_eq!(lds_use("ds_read2_b32"), LdsUse::Read);
     assert_eq!(lds_use("ds_write_b32"), LdsUse::Write);
-    assert_eq!(lds_use("ds_add_u32"), lds_use("ds_add_rtn_u32"));
+    // The returning form hands each lane an old value that depends on the order.
+    assert_eq!(lds_use("ds_add_rtn_u32"), LdsUse::Write);
     assert_eq!(lds_use("ds_add_u32"), LdsUse::Atomic("add_u32".into()));
     assert_ne!(lds_use("ds_add_u32"), lds_use("ds_max_u32"));
     // not order-free: exchange, compare-store, wrapping increments
