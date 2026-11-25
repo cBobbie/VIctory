@@ -65,6 +65,10 @@ pub(crate) struct Picked<C> {
     by_entry: HashMap<u32, Vec<u32>>,
     /// Table entries freed since the last pass; `None`: not known.
     forgotten: Option<Vec<u32>>,
+    /// Kept slots whose record names its view whole (no table entry): a
+    /// freed resource reaches them through no entry, so they are looked
+    /// at again every [`ORPHANS_EVERY`] passes, as the old pass did.
+    whole: HashSet<u32>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
     full: bool,
 }
@@ -78,6 +82,7 @@ impl<C: Clone> Picked<C> {
             orphans: HashMap::new(),
             by_entry: HashMap::new(),
             forgotten: None,
+            whole: HashSet::new(),
             full,
         }
     }
@@ -140,6 +145,9 @@ impl<C: Clone> Picked<C> {
             }
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
+        if orphans_too {
+            due.extend(self.whole.iter().copied());
+        }
         for (&slot, &seen) in &self.orphans {
             if orphans_too || record(slot) != Some(seen) {
                 due.insert(slot);
@@ -162,11 +170,13 @@ impl<C: Clone> Picked<C> {
         self.copies.clear();
         self.orphans.clear();
         self.by_entry.clear();
+        self.whole.clear();
     }
 
     /// What slot `slot` held is let go (it is looked at now).
     pub(crate) fn forget(&mut self, slot: u32) {
         self.orphans.remove(&slot);
+        self.whole.remove(&slot);
         let Some(old) = self.slots.remove(&slot) else {
             return;
         };
@@ -185,6 +195,9 @@ impl<C: Clone> Picked<C> {
     pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>) {
         self.forget(slot);
         self.note_entry(slot, entry);
+        if entry.is_none() && !self.full {
+            self.whole.insert(slot);
+        }
         self.slots.insert(slot, Slot { copy: key, from, to, record });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
@@ -347,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn orphans_are_tried_again_every_16_passes_and_all_slots_now_and_then() {
+    fn orphans_and_whole_view_slots_are_tried_again_every_16_passes_and_all_slots_now_and_then() {
         let heap = heap(4);
         let mut p: Picked<u32> = Picked::new(false);
         let _ = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
@@ -357,7 +370,9 @@ mod tests {
         p.orphan(3, heap.record(3).unwrap(), None);
         for n in 1..FULL_EVERY {
             let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
-            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![3] } else { vec![] };
+            // Slots 0-2 name their views whole (no table entry): a freed
+            // resource reaches them through none, so they go with the orphans.
+            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![0, 1, 2, 3] } else { vec![] };
             assert_eq!(due, want, "pass {n}");
         }
         let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);

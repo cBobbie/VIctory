@@ -1911,6 +1911,28 @@ impl Shadow {
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
+    /// Whether title memory `[address, address + len)` still holds what
+    /// the CPU's side of the copy does: the title has not written it since
+    /// the copy last took it. Then the card's side holds those bytes or
+    /// newer ones shaders wrote, and may stand for title memory there
+    /// (`HostList::card_constants`); a refresh leaves ranges flights may
+    /// write alone, so title writes there reach the card only after they
+    /// land. False if the range is not all in the copy or not mapped.
+    pub(crate) fn title_unchanged(&self, address: u64, len: u64) -> bool {
+        let (from, to) = self.inside(address as usize, len as usize);
+        if to - from != len as usize || len == 0 {
+            return false;
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into((self.start as usize + from) as *const u8, &mut title) {
+            return false;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: inside the mapping (checked above), under the CPU side's lock.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+        held == title.as_slice()
+    }
+
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);

@@ -2238,6 +2238,7 @@ impl State {
                             && crate::host::late()
                             && crate::host::flights_write(address as usize, address as usize + size as usize)
                             && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.title_unchanged(address, u64::from(size))
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
                                 list.card_constants(&shadow, address, u64::from(size))
