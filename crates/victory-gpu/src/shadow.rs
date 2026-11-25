@@ -91,9 +91,8 @@ struct Card {
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
     before: Mutex<Option<ID3D12Resource>>,
-    /// Offsets of the copy whose bytes changed on the CPU's side and have
-    /// not gone to the card's side yet.
-    dirty: Mutex<Vec<(usize, usize)>>,
+    /// Pending uploads and comparison-hash refreshes, in offsets into this copy.
+    dirty: Mutex<CardUpdates>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -295,10 +294,53 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
-/// The copies in the card's memory whose CPU side changed since they were
-/// last asked: each with the changed offsets, in order and joined where
-/// they touch. The ranges are taken: the caller copies them to the card's
-/// side (`Host::card_before`).
+/// Three-way merge of one fetched span. The card's byte wins wherever shaders
+/// changed it. Otherwise the title's current byte wins. Report which destination
+/// still differs from the result before changing either destination.
+fn merged_destinations(old: &mut [u8], gpu: &[u8], title: &mut [u8]) -> (bool, bool) {
+    let (mut title_diff, mut gpu_diff) = (0u8, 0u8);
+    for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+        let wrote = if *g != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*g & wrote);
+        title_diff |= merged ^ *t;
+        gpu_diff |= merged ^ *g;
+        *t = merged;
+        *o = merged;
+    }
+    (title_diff != 0, gpu_diff != 0)
+}
+
+/// CPU writes to upload, and changes already in card memory whose comparison hashes
+/// still need refreshing before the next submission.
+#[derive(Default)]
+pub(crate) struct CardUpdates {
+    pub(crate) upload: Vec<(usize, usize)>,
+    hash_only: Vec<(usize, usize)>,
+}
+
+impl CardUpdates {
+    fn mark(&mut self, from: usize, to: usize, already_on_card: bool) {
+        if from >= to {
+            return;
+        }
+        let ranges = if already_on_card { &mut self.hash_only } else { &mut self.upload };
+        match ranges.last_mut() {
+            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+            _ => ranges.push((from, to)),
+        }
+    }
+
+    pub(crate) fn hash_ranges(&self) -> std::borrow::Cow<'_, [(usize, usize)]> {
+        if self.hash_only.is_empty() {
+            std::borrow::Cow::Borrowed(&self.upload)
+        } else {
+            std::borrow::Cow::Owned(joined(self.upload.iter().chain(&self.hash_only).copied().collect()))
+        }
+    }
+}
+
+/// Take the ranges to upload and rehash before the next submission. Upload ranges
+/// are joined where they touch. A waited fetch can also leave hash-only changes.
 ///
 /// With [`relay`], `sent_as` is the number of the send that takes them
 /// (`crate::host`'s order of the queue): each range is noted with it, in
@@ -306,7 +348,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, CardUpdates)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -314,7 +356,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
+        let mut ranges = shadow
             .card
             .as_ref()
             .map(|c| {
@@ -323,13 +365,14 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                    sent.extend(ranges.upload.iter().map(|&(a, b)| (a, b, sent_as)));
                 }
                 ranges
             })
             .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+        if !ranges.upload.is_empty() || !ranges.hash_only.is_empty() {
+            ranges.upload = joined(ranges.upload);
+            out.push((shadow, ranges));
         }
         true
     });
@@ -406,6 +449,40 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    #[test]
+    fn echo_classification_preserves_each_merge_destination() {
+        // Exhaustively combine title-only, GPU-only, coincident, and conflicting edits.
+        for old_byte in 0..3 {
+            for gpu_byte in 0..3 {
+                for title_byte in 0..3 {
+                    let mut held = [0, old_byte, 0];
+                    let mut title = [0, title_byte, 0];
+                    let gpu = [0, gpu_byte, 0];
+                    let expected = if gpu_byte != old_byte { gpu_byte } else { title_byte };
+                    let destinations = super::merged_destinations(&mut held, &gpu, &mut title);
+                    assert_eq!(held, [0, expected, 0]);
+                    assert_eq!(title, held);
+                    assert_eq!(destinations, (expected != title_byte, expected != gpu_byte));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_uploads_still_refresh_hashes_and_preserve_pending_cpu_writes() {
+        let p = 1 << 16;
+        let mut updates = super::CardUpdates::default();
+        updates.mark(p - 2, p + 2, false); // A pending CPU upload crosses a piece boundary.
+        updates.mark(p - 4, p + 1, true);
+        updates.mark(p, p + 4, true);
+        assert_eq!(updates.upload, [(p - 2, p + 2)]);
+        assert_eq!(&*updates.hash_ranges(), &[(p - 4, p + 4)]);
+        let mut only_hash = super::CardUpdates::default();
+        only_hash.mark(3, 8, true);
+        assert!(only_hash.upload.is_empty());
+        assert_eq!(&*only_hash.hash_ranges(), &[(3, 8)]);
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -2534,14 +2611,8 @@ impl Shadow {
         let Some(card) = &self.card else {
             return;
         };
-        if from >= to {
-            return;
-        }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
-        }
+        dirty.mark(from, to, false);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -2596,12 +2667,13 @@ impl Shadow {
     /// found differing. The bytes shaders wrote (those that differ from the
     /// CPU's side, which is what the card's side held when they started)
     /// go into title memory, from the first to the last of them, as
-    /// [`Shadow::copy_back`] puts them; the CPU's side takes the result and
-    /// sends it up before the next submission. `title` is scratch memory.
+    /// [`Shadow::copy_back`] puts them. The CPU side takes the result, and only
+    /// a result that differs from the card needs uploading. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        let Some(card) = &self.card else { return 0 };
+        if at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -2616,29 +2688,22 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
+        let mut upload = false;
         if crate::host::read_into((start + at) as *const u8, title) {
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            let (write_title, write_card) = merged_destinations(old, gpu, title);
+            upload = write_card;
+            if write_title {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
         } else {
-            // Title memory is not mapped there: the copy keeps what the
-            // card wrote, as before.
             old.copy_from_slice(gpu);
         }
-        // The card's side and its "before" take the result.
-        self.card_changed(at, at + n);
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        // Concurrent relay submissions can change the card after a fetch. Only elide
+        // uploads in non-relay mode, which holds submission ordering through the merge.
+        dirty.mark(at, at + n, !upload && !relay());
         written
     }
 
@@ -2683,7 +2748,7 @@ impl Shadow {
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
+            dirty.upload
                 .iter()
                 .copied()
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
