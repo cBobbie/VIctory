@@ -682,6 +682,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mapped_run_by_pages_agrees_with_regions() {
+        use windows_sys::Win32::System::Memory::*;
+        const P: usize = 4096;
+        // SAFETY: a private region of our own; pages are touched only while
+        // committed and writable.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 6 * P, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), 5 * P, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            // Pages 0, 1 and 3 resident; 2 and 4 committed, never touched.
+            // Locked, so that no trim of the working set takes them meanwhile.
+            for k in [0, 1, 3] {
+                base.add(k * P).write(1);
+                assert_ne!(VirtualLock(base.add(k * P).cast(), P), 0);
+            }
+            let b = base as usize;
+            assert_eq!(super::resident_run(b + 5, b + 6 * P, true), Some(b + 2 * P));
+            assert_eq!(super::resident_run(b + 2 * P, b + 6 * P, true), None);
+            // Untouched pages are asked of their region: committed to page 5.
+            assert_eq!(super::mapped_run(b + 5, b + 6 * P, true), Some(b + 5 * P));
+            assert_eq!(super::mapped_run(b + 5 * P, b + 6 * P, false), None);
+            // Read-only page 1: a run for reading, not for writing.
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.add(P).cast(), P, PAGE_READONLY, &mut old), 0);
+            assert_eq!(super::resident_run(b, b + 2 * P, true), Some(b + P));
+            assert_eq!(super::resident_run(b, b + 2 * P, false), Some(b + 2 * P));
+            assert_eq!(super::mapped_run(b, b + 4 * P, true), Some(b + P));
+            assert_eq!(super::mapped_run(b, b + 4 * P, false), Some(b + 4 * P));
+            // A run that ends inside a page.
+            assert_eq!(super::mapped_run(b + 7, b + 100, true), Some(b + 100));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -5575,6 +5610,10 @@ fn mapped_run(at: usize, end: usize, write: bool) -> Option<usize> {
     };
     let mut p = at;
     while p < end {
+        if let Some(to) = resident_run(p, end, write) {
+            p = to;
+            continue;
+        }
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(p as _, &mut info, size_of_val(&info)) };
@@ -5596,6 +5635,50 @@ fn mapped_run(at: usize, end: usize, write: bool) -> Option<usize> {
         p = next;
     }
     Some(end)
+}
+
+/// [`mapped_run`] for pages in the working set, asked of their own page
+/// table entries (`QueryWorkingSetEx`), `None` if the page at `at` is not
+/// one (not resident, or not readable or writable as asked): `mapped_run`
+/// then asks `VirtualQuery`, which sizes the whole region it finds. In the
+/// title's big pools that is about 2 ms a call, and putting back what
+/// shaders wrote asked it once a piece: about 1.1 s a frame of the relay's
+/// landing, a quarter of the process's CPU samples (run fb-x4, PIX).
+fn resident_run(at: usize, end: usize, write: bool) -> Option<usize> {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 4096;
+    const BATCH: usize = 64;
+    let mut info = [PSAPI_WORKING_SET_EX_INFORMATION::default(); BATCH];
+    let mut p = at & !(PAGE - 1);
+    'ask: while p < end {
+        let n = (end - p).div_ceil(PAGE).min(BATCH);
+        for (k, e) in info[..n].iter_mut().enumerate() {
+            e.VirtualAddress = (p + k * PAGE) as _;
+        }
+        // SAFETY: the call fills the `n` entries we pass.
+        let size = (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), info.as_mut_ptr().cast(), size) } == 0 {
+            break;
+        }
+        for e in &info[..n] {
+            // SAFETY: every bit pattern is a valid `usize`.
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            // Bit 0 valid (resident); bits 4-14 the page's protection.
+            let protect = ((flags >> 4) & 0x7ff) as u32;
+            let base = protect & 0xff;
+            let ok = flags & 1 != 0
+                && protect & 0x100 == 0
+                && base != 0
+                && base != 0x01
+                && (!write || matches!(base, 0x04 | 0x08 | 0x40 | 0x80));
+            if !ok {
+                break 'ask;
+            }
+            p += PAGE;
+        }
+    }
+    (p > at).then_some(p.min(end))
 }
 
 fn mapped_whole(at: usize, len: usize, write: bool) -> bool {
