@@ -1268,8 +1268,10 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Looked up before the slots are locked: other threads making this
+        // heap's slots need not wait on the views table too.
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
