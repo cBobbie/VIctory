@@ -1136,7 +1136,13 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // `VICTORY_LDS_EXACT=1`: a read and a write in one region are refused only where they may
     // touch the same dword (an address not known is taken to touch every dword), and atomics of
     // one order-free kind (add, min...) on the same dword do not need each other's order.
-    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    // On by default on hosts of 32-lane waves (NVIDIA): without it such a program keeps
+    // `WaveSize(64)`, which they refuse, and its pass does not run at all (4 of the
+    // prologue's compute programs; 369cbe906ea72764 is made with it). `=0` turns it off.
+    let exact = match std::env::var_os("VICTORY_LDS_EXACT") {
+        Some(v) => v == "1",
+        None => host_max_wave() == 32,
+    };
     if (0..n).any(|r| reads[r] && writes[r] && (!exact || lds_conflict(&uses[r]))) {
         return None;
     }
