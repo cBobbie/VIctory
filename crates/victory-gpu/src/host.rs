@@ -1689,6 +1689,10 @@ struct CardRange {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// The number of this plan's sends in [`QUEUE_ORDER`] (0 without the
+    /// relay): its list went to the queue ahead of the submission's, so
+    /// once the submission has run, sends 1..=this have too.
+    sent_as: u64,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -1932,6 +1936,16 @@ pub(crate) fn relay() -> bool {
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| relay() && crate::shadow::relay_level() == 2)
+}
+
+/// Whether the relay fetches card copies' pieces on a copy queue of its
+/// own (`VICTORY_RELAY_COPY_QUEUE=0` puts them behind the frame's work on
+/// the host's queue, as before). Behind the frame's work the relay waited
+/// about 400 ms a frame for its fetches with the card about 76% busy (run
+/// fb-x8): each waited for every list queued ahead of it.
+fn relay_copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY_QUEUE").is_none_or(|v| v != "0"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2507,6 +2521,9 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// A copy queue of the relay's own and a copy list for it
+    /// ([`relay_copy_queue`]): fetches there run beside the frame's work.
+    copy: Option<(ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -3299,6 +3316,7 @@ impl Host {
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sent_as,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -3422,8 +3440,22 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            let copy = relay_copy_queue()
+                .then(|| -> windows::core::Result<_> {
+                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })?;
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((queue, allocator, list))
+                })
+                .and_then(|made| made.inspect_err(|e| tracing::warn!(error = %e, "no copy queue for the relay's fetches: they go behind the frame's work")).ok());
             Some(RelayFetch {
                 list,
+                copy,
                 fence,
                 event,
                 sent: 0,
@@ -3484,8 +3516,16 @@ impl Host {
             }
         }
         if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            // Nothing to fetch: every send so far is older than the next fetch
+            // on the host's queue. On the relay's copy queue the next fetch
+            // counts only as after its own plans' sends, so only those of
+            // these plans have surely run.
+            let fetched = if fetch.as_ref().is_some_and(|f| f.copy.is_some()) || (fetch.is_none() && relay_copy_queue()) {
+                plans.iter().map(|p| p.sent_as).max().unwrap_or(0)
+            } else {
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            crate::shadow::relay_fetched(fetched);
             return;
         }
         if fetch.is_none() {
@@ -3504,10 +3544,36 @@ impl Host {
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let waiting = std::time::Instant::now();
+        // On the relay's copy queue (`relay_copy_queue`) the fetch runs now,
+        // beside the frame's work, and counts as after the sends that the
+        // flights being landed went behind: they have run. Later sends, and
+        // later flights' shaders still writing, may be under way while it
+        // reads; the merge leaves out bytes of sends after it, and a later
+        // flight's landing fetches its pieces again.
+        let copied = f.copy.clone().map(|(queue, allocator, list)| {
+            let after = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+            // SAFETY: as below; buffers may be read by one queue while
+            // another writes them.
+            unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in &pieces {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(after)
+                })()
+            }
+        });
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
-        let ran = unsafe {
+        let ran = if let Some(copied) = copied { copied } else { unsafe {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
@@ -3528,7 +3594,7 @@ impl Host {
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
-        };
+        } };
         let after = match ran {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
