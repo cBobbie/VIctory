@@ -454,7 +454,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// ([`relay_level`] above 0, the default; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -470,7 +470,26 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| relay_level() > 0 && !keeps())
+}
+
+/// The relay's stage from `VICTORY_RELAY`: `0` turns it off, `1` is its
+/// first stage, `2` (also when unset or anything else) its second
+/// (`crate::host::relay`). Stage 2 is the default: in the world of the
+/// test title on an RTX 4090 the frame went from about 230 to about
+/// 132 ms with it (the card busy about 79 % of the frame instead of 51 %).
+pub(crate) fn relay_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| relay_level_of(std::env::var("VICTORY_RELAY").ok().as_deref()))
+}
+
+/// [`relay_level`] for a value of `VICTORY_RELAY` (`None`: unset).
+fn relay_level_of(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    }
 }
 
 /// The submission being prepared (its number among those started): what
@@ -591,7 +610,17 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, relay_level_of};
+
+    #[test]
+    fn the_relay_is_at_stage_two_unless_told_otherwise() {
+        assert_eq!(relay_level_of(None), 2);
+        assert_eq!(relay_level_of(Some("2")), 2);
+        assert_eq!(relay_level_of(Some("1")), 1);
+        assert_eq!(relay_level_of(Some("0")), 0);
+        assert_eq!(relay_level_of(Some(" 0 ")), 0);
+        assert_eq!(relay_level_of(Some("")), 2);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
