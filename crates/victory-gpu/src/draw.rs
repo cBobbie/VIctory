@@ -3070,9 +3070,12 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
+        {
+            list.note_op(|| {
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            });
+            list.note_args(&bounded, at, if matches!(kind, DISPATCH | MESH) { 12 } else { 16 });
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }

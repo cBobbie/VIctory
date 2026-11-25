@@ -4646,7 +4646,9 @@ impl HostList {
                 let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
+                    // The timestamps, then 16 bytes a command for the
+                    // arguments of indirect ones (`note_args`).
+                    Width: u64::from(STAMPS) * 24,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -4687,25 +4689,53 @@ impl HostList {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
+        let range = D3D12_RANGE { Begin: 0, End: STAMPS as usize * 24 };
+        // SAFETY: a read-back buffer the finished list resolved and copied into.
+        let (stamps, args): (Vec<u64>, Vec<[u32; 4]>) = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return Vec::new();
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            let a = std::slice::from_raw_parts(data.cast::<u8>().add(STAMPS as usize * 8).cast::<[u32; 4]>(), count).to_vec();
             back.Unmap(0, None);
-            s
+            (s, a)
         };
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                let mut text: String = notes[i].0.chars().take(300).collect();
+                // What an indirect command asked for, as clamped (`note_args`).
+                if text.starts_with("indirect") {
+                    text = format!("{text} | clamped args {:?}", args[i]);
+                }
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, text)
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// With `VICTORY_GPU_TIMING`: the first record (up to 16 bytes) of the
+    /// clamped arguments of the indirect command just noted, `bounded` at
+    /// `at`, is copied beside the timestamps, so the slow-command lines say
+    /// what it ran (a dispatch's group counts, a draw's vertex counts).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_args(&self, bounded: &ID3D12Resource, at: u64, len: u64) {
+        let Some((_, back)) = self.stamps() else {
+            return;
+        };
+        let noted = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let Some(index) = noted.checked_sub(1).filter(|&i| i < STAMPS as usize - 1) else {
+            return;
+        };
+        // SAFETY: an open list; `bounded` was left readable as arguments by
+        // its clamp and goes back to that state; `back` stays a copy target.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(bounded, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.CopyBufferRegion(back, u64::from(STAMPS) * 8 + index as u64 * 16, bounded, at, len.min(16));
+            self.list.ResourceBarrier(&[transition(bounded, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+        }
     }
 
     pub(crate) fn close(&self) {
