@@ -37,13 +37,24 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
+/// What identifies this build's translations: the translator's source
+/// (`victory_shader::SOURCE`), this file's own (the entries' encoding), and
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time). It was the BLAKE3 of our
+/// whole executable, so every rebuild, of anything, translated every shader
+/// again: minutes of dropped draws at each start after a change.
+/// `VICTORY_SHADER_CACHE_BY_EXE=1` keys by the executable as before.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let by_exe = std::env::var_os("VICTORY_SHADER_CACHE_BY_EXE").is_some_and(|v| v == "1");
+        let exe = if by_exe {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            let mut bytes = victory_shader::SOURCE.as_bytes().to_vec();
+            bytes.extend_from_slice(include_bytes!("shader_cache.rs"));
+            Ok(bytes)
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(

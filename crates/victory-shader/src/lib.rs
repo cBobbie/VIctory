@@ -6,6 +6,10 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+/// A fingerprint of this crate's source and enabled features (`build.rs`):
+/// two builds with the same one translate alike.
+pub const SOURCE: &str = env!("VICTORY_SHADER_SOURCE");
+
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
